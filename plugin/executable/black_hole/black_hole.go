@@ -25,9 +25,9 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
+	"math/rand"
 	"net/netip"
 	"strings"
-	"math/rand"
 	"sync"
 )
 
@@ -40,8 +40,8 @@ func init() {
 var _ sequence.Executable = (*BlackHole)(nil)
 
 type BlackHole struct {
-	ipv4 []netip.Addr
-	ipv6 []netip.Addr
+	ipv4         []netip.Addr
+	ipv6         []netip.Addr
 	shuffleMutex sync.Mutex
 }
 
