@@ -1,10 +1,10 @@
 module github.com/IrineSistiana/mosdns/v5
 
-go 1.24
+go 1.25
 
 require (
 	github.com/IrineSistiana/go-bytes-pool v0.0.0-20230918115058-c72bd9761c57
-	github.com/go-chi/chi/v5 v5.2.2
+	github.com/go-chi/chi/v5 v5.2.3
 	github.com/go-viper/mapstructure/v2 v2.3.0
 	github.com/google/nftables v0.3.0
 	github.com/kardianos/service v1.2.2
@@ -22,8 +22,8 @@ require (
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b
 	golang.org/x/net v0.43.0
-	golang.org/x/sync v0.16.0
-	golang.org/x/sys v0.35.0
+	golang.org/x/sync v0.17.0
+	golang.org/x/sys v0.36.0
 	golang.org/x/time v0.12.0
 	google.golang.org/protobuf v1.36.8
 )
