@@ -23,12 +23,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v5/coremain"
-	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
-	"github.com/IrineSistiana/mosdns/v5/pkg/zone_file"
-	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"github.com/IrineSistiana/mosdns/v5/pkg/zone_file"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
+	"go.uber.org/zap"
 )
 
 const PluginType = "arbitrary"
@@ -45,38 +50,68 @@ type Args struct {
 var _ sequence.Executable = (*Arbitrary)(nil)
 
 type Arbitrary struct {
-	m *zone_file.Matcher
+	m  atomic.Pointer[zone_file.Matcher]
+	fw *utils.FileWatcher
 }
 
-func NewArbitrary(args *Args) (*Arbitrary, error) {
-	m := new(zone_file.Matcher)
-	for i, s := range args.Rules {
-		if err := m.Load(strings.NewReader(s)); err != nil {
-			return nil, fmt.Errorf("failed to load rr #%d [%s], %w", i, s, err)
+func NewArbitrary(bp *coremain.BP, args *Args) (*Arbitrary, error) {
+	a := &Arbitrary{}
+
+	loadInner := func() (*zone_file.Matcher, error) {
+		m := new(zone_file.Matcher)
+		for i, s := range args.Rules {
+			if err := m.Load(strings.NewReader(s)); err != nil {
+				return nil, fmt.Errorf("failed to load rr #%d [%s], %w", i, s, err)
+			}
 		}
+		for i, file := range args.Files {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read file #%d [%s], %w", i, file, err)
+			}
+			if err := m.Load(bytes.NewReader(b)); err != nil {
+				return nil, fmt.Errorf("failed to load rr file #%d [%s], %w", i, file, err)
+			}
+		}
+		return m, nil
 	}
-	for i, file := range args.Files {
-		b, err := os.ReadFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read file #%d [%s], %w", i, file, err)
-		}
-		if err := m.Load(bytes.NewReader(b)); err != nil {
-			return nil, fmt.Errorf("failed to load rr file #%d [%s], %w", i, file, err)
-		}
+
+	inner, err := loadInner()
+	if err != nil {
+		return nil, err
 	}
-	return &Arbitrary{
-		m: m,
-	}, nil
+	a.m.Store(inner)
+
+	if len(args.Files) > 0 {
+		a.fw = utils.StartFileWatcher(args.Files, time.Second*3, func(changedFiles []string) {
+			newInner, err := loadInner()
+			if err == nil {
+				a.m.Store(newInner)
+				bp.L().Info("reloaded files", zap.Strings("files", changedFiles))
+			}
+		})
+	}
+
+	return a, nil
 }
 
 func (a *Arbitrary) Exec(_ context.Context, qCtx *query_context.Context) error {
-	if r := a.m.Reply(qCtx.Q()); r != nil {
-		qCtx.SetResponse(r)
+	if inner := a.m.Load(); inner != nil {
+		if r := inner.Reply(qCtx.Q()); r != nil {
+			qCtx.SetResponse(r)
+		}
 	}
 	return nil
 }
 
-func Init(_ *coremain.BP, v any) (any, error) {
+func (a *Arbitrary) Close() error {
+	if a.fw != nil {
+		return a.fw.Close()
+	}
+	return nil
+}
+
+func Init(bp *coremain.BP, v any) (any, error) {
 	args := v.(*Args)
-	return NewArbitrary(args)
+	return NewArbitrary(bp, args)
 }

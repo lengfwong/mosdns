@@ -22,12 +22,17 @@ package ip_set
 import (
 	"bytes"
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v5/coremain"
-	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
-	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
 	"net/netip"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
+	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
+	"go.uber.org/zap"
 )
 
 const PluginType = "ip_set"
@@ -49,31 +54,67 @@ type Args struct {
 var _ data_provider.IPMatcherProvider = (*IPSet)(nil)
 
 type IPSet struct {
-	mg []netlist.Matcher
+	mg atomic.Pointer[MatcherGroup]
+	fw *utils.FileWatcher
 }
 
 func (d *IPSet) GetIPMatcher() netlist.Matcher {
-	return MatcherGroup(d.mg)
+	return d
+}
+
+func (d *IPSet) Match(addr netip.Addr) bool {
+	if mg := d.mg.Load(); mg != nil {
+		return mg.Match(addr)
+	}
+	return false
+}
+
+func (d *IPSet) Close() error {
+	if d.fw != nil {
+		return d.fw.Close()
+	}
+	return nil
 }
 
 func NewIPSet(bp *coremain.BP, args *Args) (*IPSet, error) {
 	p := &IPSet{}
 
-	l := netlist.NewList()
-	if err := LoadFromIPsAndFiles(args.IPs, args.Files, l); err != nil {
+	loadInner := func() (*MatcherGroup, error) {
+		var mg MatcherGroup
+		l := netlist.NewList()
+		if err := LoadFromIPsAndFiles(args.IPs, args.Files, l); err != nil {
+			return nil, err
+		}
+		l.Sort()
+		if l.Len() > 0 {
+			mg = append(mg, l)
+		}
+		for _, tag := range args.Sets {
+			provider, _ := bp.M().GetPlugin(tag).(data_provider.IPMatcherProvider)
+			if provider == nil {
+				return nil, fmt.Errorf("%s is not an IPMatcherProvider", tag)
+			}
+			mg = append(mg, provider.GetIPMatcher())
+		}
+		return &mg, nil
+	}
+
+	mg, err := loadInner()
+	if err != nil {
 		return nil, err
 	}
-	l.Sort()
-	if l.Len() > 0 {
-		p.mg = append(p.mg, l)
+	p.mg.Store(mg)
+
+	if len(args.Files) > 0 {
+		p.fw = utils.StartFileWatcher(args.Files, time.Second*3, func(changedFiles []string) {
+			newMg, err := loadInner()
+			if err == nil {
+				p.mg.Store(newMg)
+				bp.L().Info("reloaded files", zap.Strings("files", changedFiles))
+			}
+		})
 	}
-	for _, tag := range args.Sets {
-		provider, _ := bp.M().GetPlugin(tag).(data_provider.IPMatcherProvider)
-		if provider == nil {
-			return nil, fmt.Errorf("%s is not an IPMatcherProvider", tag)
-		}
-		p.mg = append(p.mg, provider.GetIPMatcher())
-	}
+
 	return p, nil
 }
 

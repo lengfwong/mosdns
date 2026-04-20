@@ -25,10 +25,13 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
@@ -48,11 +51,12 @@ type Args struct {
 }
 
 type Redirect struct {
-	m *domain.MixMatcher[string]
+	m  atomic.Pointer[domain.MixMatcher[string]]
+	fw *utils.FileWatcher
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
-	r, err := NewRedirect(args.(*Args))
+	r, err := NewRedirect(bp, args.(*Args))
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +64,8 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	return r, nil
 }
 
-func NewRedirect(args *Args) (*Redirect, error) {
+func NewRedirect(bp *coremain.BP, args *Args) (*Redirect, error) {
+	r := &Redirect{}
 	parseFunc := func(s string) (p, v string, err error) {
 		f := strings.Fields(s)
 		if len(f) != 2 {
@@ -68,23 +73,44 @@ func NewRedirect(args *Args) (*Redirect, error) {
 		}
 		return f[0], dns.Fqdn(f[1]), nil
 	}
-	m := domain.NewMixMatcher[string]()
-	m.SetDefaultMatcher(domain.MatcherFull)
-	for i, rule := range args.Rules {
-		if err := domain.Load[string](m, rule, parseFunc); err != nil {
-			return nil, fmt.Errorf("failed to load rule #%d %s, %w", i, rule, err)
+
+	loadInner := func() (*domain.MixMatcher[string], error) {
+		m := domain.NewMixMatcher[string]()
+		m.SetDefaultMatcher(domain.MatcherFull)
+		for i, rule := range args.Rules {
+			if err := domain.Load[string](m, rule, parseFunc); err != nil {
+				return nil, fmt.Errorf("failed to load rule #%d %s, %w", i, rule, err)
+			}
 		}
+		for i, file := range args.Files {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read file #%d %s, %w", i, file, err)
+			}
+			if err := domain.LoadFromTextReader[string](m, bytes.NewReader(b), parseFunc); err != nil {
+				return nil, fmt.Errorf("failed to load file #%d %s, %w", i, file, err)
+			}
+		}
+		return m, nil
 	}
-	for i, file := range args.Files {
-		b, err := os.ReadFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read file #%d %s, %w", i, file, err)
-		}
-		if err := domain.LoadFromTextReader[string](m, bytes.NewReader(b), parseFunc); err != nil {
-			return nil, fmt.Errorf("failed to load file #%d %s, %w", i, file, err)
-		}
+
+	inner, err := loadInner()
+	if err != nil {
+		return nil, err
 	}
-	return &Redirect{m: m}, nil
+	r.m.Store(inner)
+
+	if len(args.Files) > 0 {
+		r.fw = utils.StartFileWatcher(args.Files, time.Second*3, func(changedFiles []string) {
+			newInner, err := loadInner()
+			if err == nil {
+				r.m.Store(newInner)
+				bp.L().Info("reloaded files", zap.Strings("files", changedFiles), zap.Int("length", newInner.Len()))
+			}
+		})
+	}
+
+	return r, nil
 }
 
 func (r *Redirect) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
@@ -94,7 +120,12 @@ func (r *Redirect) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	}
 
 	orgQName := q.Question[0].Name
-	redirectTarget, ok := r.m.Match(orgQName)
+	inner := r.m.Load()
+	if inner == nil {
+		return next.ExecNext(ctx, qCtx)
+	}
+
+	redirectTarget, ok := inner.Match(orgQName)
 	if !ok {
 		return next.ExecNext(ctx, qCtx)
 	}
@@ -104,16 +135,16 @@ func (r *Redirect) Exec(ctx context.Context, qCtx *query_context.Context, next s
 		q.Question[0].Name = orgQName
 	}()
 	err := next.ExecNext(ctx, qCtx)
-	if r := qCtx.R(); r != nil {
+	if rResp := qCtx.R(); rResp != nil {
 		// Restore original query name.
-		for i := range r.Question {
-			if r.Question[i].Name == redirectTarget {
-				r.Question[i].Name = orgQName
+		for i := range rResp.Question {
+			if rResp.Question[i].Name == redirectTarget {
+				rResp.Question[i].Name = orgQName
 			}
 		}
 
 		// Insert a CNAME record.
-		newAns := make([]dns.RR, 1, len(r.Answer)+1)
+		newAns := make([]dns.RR, 1, len(rResp.Answer)+1)
 		newAns[0] = &dns.CNAME{
 			Hdr: dns.RR_Header{
 				Name:   orgQName,
@@ -123,12 +154,22 @@ func (r *Redirect) Exec(ctx context.Context, qCtx *query_context.Context, next s
 			},
 			Target: redirectTarget,
 		}
-		newAns = append(newAns, r.Answer...)
-		r.Answer = newAns
+		newAns = append(newAns, rResp.Answer...)
+		rResp.Answer = newAns
 	}
 	return err
 }
 
 func (r *Redirect) Len() int {
-	return r.m.Len()
+	if inner := r.m.Load(); inner != nil {
+		return inner.Len()
+	}
+	return 0
+}
+
+func (r *Redirect) Close() error {
+	if r.fw != nil {
+		return r.fw.Close()
+	}
+	return nil
 }
