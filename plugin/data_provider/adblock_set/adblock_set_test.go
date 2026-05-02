@@ -42,6 +42,8 @@ func TestParseAndMatch(t *testing.T) {
 blocked.com
 domain:ntp.org
 full:metrics.icloud.com
+0.0.0.0 singlehotmilf.online
+127.0.0.1 deezer.deliveryengine.adswizz.com
 `
 	blacklist := domain.NewMixMatcher[struct{}]()
 	whitelist := domain.NewMixMatcher[struct{}]()
@@ -75,6 +77,10 @@ full:metrics.icloud.com
 		{"sub.ntp.org", true},   // matched by domain:ntp.org
 		{"metrics.icloud.com", true}, // matched by full:metrics.icloud.com
 		{"sub.metrics.icloud.com", false}, // full match only
+		{"singlehotmilf.online", true},             // hosts: 0.0.0.0
+		{"sub.singlehotmilf.online", false},        // hosts: exact match only
+		{"deezer.deliveryengine.adswizz.com", true}, // hosts: 127.0.0.1
+		{"sub.deezer.deliveryengine.adswizz.com", false}, // hosts: exact match only
 	}
 
 	for _, tt := range tests {
