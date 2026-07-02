@@ -38,6 +38,14 @@ type LogConfig struct {
 
 	// Production enables json output.
 	Production bool `yaml:"production"`
+
+	// Size of log file limit. Default is 1M.
+	// Supported units: K, M, G, T. If no unit, defaults to M.
+	Size string `yaml:"size"`
+
+	// Max number of old log files to retain. Default is 3.
+	// Set to a negative number to retain all files.
+	Backups int `yaml:"backups"`
 }
 
 var (
@@ -57,11 +65,22 @@ func NewLogger(lc LogConfig) (*zap.Logger, error) {
 
 	var out zapcore.WriteSyncer
 	if lf := lc.File; len(lf) > 0 {
-		f, _, err := zap.Open(lf)
+		maxSize, err := ParseSize(lc.Size)
 		if err != nil {
-			return nil, fmt.Errorf("open log file: %w", err)
+			return nil, fmt.Errorf("invalid log size limit: %w", err)
 		}
-		out = zapcore.Lock(f)
+
+		backups := lc.Backups
+		if backups == 0 {
+			backups = 3
+		}
+
+		rotator := &Rotator{
+			Filename:   lf,
+			MaxSize:    maxSize,
+			MaxBackups: backups,
+		}
+		out = zapcore.AddSync(rotator)
 	} else {
 		out = stderr
 	}
