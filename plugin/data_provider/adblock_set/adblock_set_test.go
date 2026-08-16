@@ -40,6 +40,7 @@ func TestParseAndMatch(t *testing.T) {
 *keyword*
 @@*white-keyword*
 blocked.com
+^full-blocked.com
 domain:ntp.org
 full:metrics.icloud.com
 0.0.0.0 singlehotmilf.online
@@ -72,6 +73,9 @@ full:metrics.icloud.com
 		{"somekeywordhere", true},
 		{"some-white-keyword-here", false},
 		{"blocked.com", true},
+		{"sub.blocked.com", true}, // default is now domain:blocked.com
+		{"full-blocked.com", true},
+		{"sub.full-blocked.com", false}, // ^full-blocked.com is full match
 		{"other.com", false},
 		{"ntp.org", true},       // matched by domain:ntp.org
 		{"sub.ntp.org", true},   // matched by domain:ntp.org
