@@ -120,8 +120,9 @@ func parseAndAddRule(rule string, m *domain.MixMatcher[struct{}]) error {
 		return m.Add("keyword:"+rule[1:len(rule)-1], struct{}{})
 	}
 
-	// 5. Default: treat as exact match if it looks like a domain
-	// Many lists are just a list of domains.
-	// AdGuard Home treats rules without || or ^ as exact matches.
-	return m.Add("full:"+rule, struct{}{})
+	// 5. Default:
+	if strings.HasPrefix(rule, "^") {
+		return m.Add("full:"+strings.TrimPrefix(rule, "^"), struct{}{})
+	}
+	return m.Add("domain:"+rule, struct{}{})
 }
