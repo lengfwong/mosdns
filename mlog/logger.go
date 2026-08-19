@@ -55,12 +55,23 @@ var (
 	s      = l.Sugar()
 
 	nop = zap.NewNop()
+
+	isDebug bool
 )
+
+func IsDebug() bool {
+	return isDebug
+}
 
 func NewLogger(lc LogConfig) (*zap.Logger, error) {
 	lvl, err := zapcore.ParseLevel(lc.Level)
 	if err != nil {
 		return nil, fmt.Errorf("invalid log level: %w", err)
+	}
+	if lvl <= zapcore.DebugLevel {
+		isDebug = true
+	} else {
+		isDebug = false
 	}
 
 	var out zapcore.WriteSyncer

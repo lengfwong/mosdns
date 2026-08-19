@@ -204,6 +204,18 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		c.hitTotal.Inc()
 		cachedResp.Id = q.Id // change msg id
 		qCtx.SetResponse(cachedResp)
+		if v, _, ok := c.backend.Get(key(msgKey)); ok && v != nil {
+			ttl := int(v.expirationTime.Sub(v.storedTime).Seconds())
+			remainingTtl := int(v.expirationTime.Sub(time.Now()).Seconds())
+			if remainingTtl < 0 {
+				remainingTtl = 0
+			}
+			qCtx.SetCacheState(true, lazyHit, ttl, remainingTtl)
+		} else {
+			qCtx.SetCacheState(true, lazyHit, 0, 0)
+		}
+	} else {
+		qCtx.SetCacheState(false, false, 0, 0)
 	}
 
 	err := next.ExecNext(ctx, qCtx)

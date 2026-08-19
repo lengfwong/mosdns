@@ -131,6 +131,11 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 		h.opts.Logger.Error("internal err: failed to pack resp msg", qCtx.InfoField(), zap.Error(err))
 		return nil
 	}
+	if mlog.IsDebug() {
+		h.opts.Logger.Debug("query log", zap.Inline(qCtx))
+	} else {
+		h.opts.Logger.Info("query log", zap.Inline(qCtx))
+	}
 	return payload
 }
 

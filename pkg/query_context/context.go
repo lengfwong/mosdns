@@ -20,9 +20,11 @@
 package query_context
 
 import (
+	"fmt"
 	"sync/atomic"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/IrineSistiana/mosdns/v5/pkg/server"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
@@ -32,6 +34,26 @@ import (
 const (
 	edns0Size = 1200
 )
+
+type UpstreamLog struct {
+	Addr     string
+	Protocol string
+	Tag      string
+	Plugin   string
+}
+
+type RuleHit struct {
+	Sequence string
+	Matches  []string
+	Exec     string
+}
+
+type CacheLog struct {
+	Hit          bool
+	LazyHit      bool
+	TTL          int
+	RemainingTTL int
+}
 
 // Context is a query context that pass through plugins.
 // All Context funcs are not safe for concurrent use.
@@ -49,9 +71,40 @@ type Context struct {
 	respOpt     *dns.OPT // nil if clientOpt == nil
 	upstreamOpt *dns.OPT // may be nil
 
+	// Log details
+	UpstreamSelected *UpstreamLog
+	RuleHits         []RuleHit
+	CacheState       CacheLog
+
 	// lazy init.
 	kv    map[uint32]any
 	marks map[uint32]struct{}
+}
+
+func (ctx *Context) AddRuleHit(seq string, matches []string, exec string) {
+	ctx.RuleHits = append(ctx.RuleHits, RuleHit{
+		Sequence: seq,
+		Matches:  matches,
+		Exec:     exec,
+	})
+}
+
+func (ctx *Context) SetUpstreamSelected(addr, protocol, tag, plugin string) {
+	ctx.UpstreamSelected = &UpstreamLog{
+		Addr:     addr,
+		Protocol: protocol,
+		Tag:      tag,
+		Plugin:   plugin,
+	}
+}
+
+func (ctx *Context) SetCacheState(hit, lazyHit bool, ttl, remainingTTL int) {
+	ctx.CacheState = CacheLog{
+		Hit:          hit,
+		LazyHit:      lazyHit,
+		TTL:          ttl,
+		RemainingTTL: remainingTTL,
+	}
 }
 
 var contextUid atomic.Uint32
@@ -237,17 +290,106 @@ func (ctx *Context) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	encoder.AddUint32("uqid", ctx.id)
 
 	if clientAddr := ctx.ServerMeta.ClientAddr; clientAddr.IsValid() {
-		zap.Stringer("client", clientAddr).AddTo(encoder)
+		encoder.AddString("client", clientAddr.String())
 	}
 
 	question := ctx.query.Question[0]
 	encoder.AddString("qname", question.Name)
-	encoder.AddUint16("qtype", question.Qtype)
+
+	qTypeStr := dns.TypeToString[question.Qtype]
+	if qTypeStr == "" {
+		qTypeStr = fmt.Sprintf("TYPE%d", question.Qtype)
+	}
+	encoder.AddString("qtype", qTypeStr)
 	encoder.AddUint16("qclass", question.Qclass)
+
+	proto := ctx.ServerMeta.Protocol
+	if proto == "" {
+		if ctx.ServerMeta.FromUDP {
+			proto = "UDP"
+		} else {
+			proto = "TCP"
+		}
+	}
+	encoder.AddString("protocol", proto)
+
+	if mlog.IsDebug() && len(ctx.RuleHits) > 0 {
+		encoder.AddArray("rule_hits", zapcore.ArrayMarshalerFunc(func(arr zapcore.ArrayEncoder) error {
+			for _, hit := range ctx.RuleHits {
+				arr.AppendObject(zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
+					enc.AddString("sequence", hit.Sequence)
+					enc.AddArray("matches", zapcore.ArrayMarshalerFunc(func(ae zapcore.ArrayEncoder) error {
+						for _, m := range hit.Matches {
+							ae.AppendString(m)
+						}
+						return nil
+					}))
+					enc.AddString("exec", hit.Exec)
+					return nil
+				}))
+			}
+			return nil
+		}))
+	}
+
+	if ctx.UpstreamSelected != nil {
+		encoder.AddObject("upstream", zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
+			enc.AddString("addr", ctx.UpstreamSelected.Addr)
+			enc.AddString("protocol", ctx.UpstreamSelected.Protocol)
+			enc.AddString("tag", ctx.UpstreamSelected.Tag)
+			enc.AddString("plugin", ctx.UpstreamSelected.Plugin)
+			return nil
+		}))
+	}
+
+	encoder.AddObject("cache", zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
+		enc.AddBool("hit", ctx.CacheState.Hit)
+		enc.AddBool("lazy_hit", ctx.CacheState.LazyHit)
+		enc.AddInt("ttl", ctx.CacheState.TTL)
+		enc.AddInt("remaining_ttl", ctx.CacheState.RemainingTTL)
+		return nil
+	}))
 
 	if r := ctx.resp; r != nil {
 		encoder.AddInt("rcode", r.Rcode)
+		encoder.AddInt("resp_size", r.Len())
+
+		var ips []string
+		var cnames []string
+		var ttl uint32
+		for _, rr := range r.Answer {
+			ttl = rr.Header().Ttl
+			switch record := rr.(type) {
+			case *dns.A:
+				ips = append(ips, record.A.String())
+			case *dns.AAAA:
+				ips = append(ips, record.AAAA.String())
+			case *dns.CNAME:
+				cnames = append(cnames, record.Target)
+			}
+		}
+
+		if len(ips) > 0 {
+			encoder.AddArray("ips", zapcore.ArrayMarshalerFunc(func(ae zapcore.ArrayEncoder) error {
+				for _, ip := range ips {
+					ae.AppendString(ip)
+				}
+				return nil
+			}))
+		}
+		if len(cnames) > 0 {
+			encoder.AddArray("cnames", zapcore.ArrayMarshalerFunc(func(ae zapcore.ArrayEncoder) error {
+				for _, c := range cnames {
+					ae.AppendString(c)
+				}
+				return nil
+			}))
+		}
+		if len(r.Answer) > 0 {
+			encoder.AddUint32("original_ttl", ttl)
+		}
 	}
+
 	encoder.AddDuration("elapsed", time.Since(ctx.startTime))
 	return nil
 }

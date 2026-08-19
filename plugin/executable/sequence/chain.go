@@ -25,6 +25,8 @@ import (
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"io"
+	"reflect"
+	"strings"
 )
 
 type ChainNode struct {
@@ -34,12 +36,17 @@ type ChainNode struct {
 	// In case both are set. E is preferred.
 	E  Executable
 	RE RecursiveExecutable
+
+	RuleMatches         []string
+	RuleExec            string
+	IsControlOrSequence bool
 }
 
 type ChainWalker struct {
-	p        int
-	chain    []*ChainNode
-	jumpBack *ChainWalker
+	p           int
+	chain       []*ChainNode
+	jumpBack    *ChainWalker
+	sequenceTag string
 }
 
 func NewChainWalker(chain []*ChainNode, jumpBack *ChainWalker) ChainWalker {
@@ -47,6 +54,49 @@ func NewChainWalker(chain []*ChainNode, jumpBack *ChainWalker) ChainWalker {
 		chain:    chain,
 		jumpBack: jumpBack,
 	}
+}
+
+func formatMatchConfig(mc MatchConfig) string {
+	var s string
+	if mc.Tag != "" {
+		s = "$" + mc.Tag
+	} else {
+		s = mc.Type
+		if mc.Args != "" {
+			s += " " + mc.Args
+		}
+	}
+	if mc.Reverse {
+		s = "!" + s
+	}
+	return s
+}
+
+func formatRuleExec(rc RuleConfig) string {
+	if rc.Tag != "" {
+		return "$" + rc.Tag
+	}
+	s := rc.Type
+	if rc.Args != "" {
+		s += " " + rc.Args
+	}
+	return s
+}
+
+func shouldLogRule(n *ChainNode, hasRespBefore, hasRespAfter bool) bool {
+	for _, m := range n.RuleMatches {
+		if !strings.HasPrefix(m, "!") {
+			return true
+		}
+	}
+	if !hasRespBefore && hasRespAfter {
+		return true
+	}
+	exec := n.RuleExec
+	if exec == "accept" || exec == "reject" || strings.HasPrefix(exec, "reject ") || exec == "drop_resp" || exec == "black_hole" {
+		return true
+	}
+	return false
 }
 
 func (w *ChainWalker) ExecNext(ctx context.Context, qCtx *query_context.Context) error {
@@ -71,16 +121,26 @@ checkMatchesLoop:
 		// Exec rules' executables in loop, or in stack if it is a recursive executable.
 		switch {
 		case n.E != nil:
+			hasRespBefore := qCtx.R() != nil
 			if err := n.E.Exec(ctx, qCtx); err != nil {
 				return err
+			}
+			hasRespAfter := qCtx.R() != nil
+			if shouldLogRule(n, hasRespBefore, hasRespAfter) {
+				qCtx.AddRuleHit(w.sequenceTag, n.RuleMatches, n.RuleExec)
 			}
 			p++
 			continue
 		case n.RE != nil:
+			hasRespBefore := qCtx.R() != nil
+			if shouldLogRule(n, hasRespBefore, false) {
+				qCtx.AddRuleHit(w.sequenceTag, n.RuleMatches, n.RuleExec)
+			}
 			next := ChainWalker{
-				p:        p + 1,
-				chain:    w.chain,
-				jumpBack: w.jumpBack,
+				p:           p + 1,
+				chain:       w.chain,
+				jumpBack:    w.jumpBack,
+				sequenceTag: w.sequenceTag,
 			}
 			return n.RE.Exec(ctx, qCtx, next)
 		default:
@@ -113,8 +173,33 @@ func (s *Sequence) buildChain(bq BQ, rs []RuleConfig) error {
 	return nil
 }
 
+func isControlOrSequence(bq BQ, rc RuleConfig) bool {
+	exec := formatRuleExec(rc)
+	if exec == "accept" || exec == "reject" || exec == "return" {
+		return false
+	}
+	if strings.HasPrefix(exec, "jump") || strings.HasPrefix(exec, "goto") || strings.HasPrefix(exec, "return") {
+		return true
+	}
+	if rc.Tag != "" {
+		p := bq.M().GetPlugin(rc.Tag)
+		if p != nil {
+			t := reflect.TypeOf(p)
+			if t != nil {
+				name := t.String()
+				if strings.Contains(name, "Sequence") || strings.Contains(name, "Fallback") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (s *Sequence) newNode(bq BQ, r RuleConfig, ri int) (*ChainNode, error) {
 	n := new(ChainNode)
+	n.RuleExec = formatRuleExec(r)
+	n.IsControlOrSequence = (len(r.Matches) == 0) && isControlOrSequence(bq, r)
 
 	// init matches
 	for mi, mc := range r.Matches {
@@ -123,6 +208,7 @@ func (s *Sequence) newNode(bq BQ, r RuleConfig, ri int) (*ChainNode, error) {
 			return nil, fmt.Errorf("failed to init matcher #%d, %w", mi, err)
 		}
 		n.Matches = append(n.Matches, m)
+		n.RuleMatches = append(n.RuleMatches, formatMatchConfig(mc))
 	}
 
 	// init exec
