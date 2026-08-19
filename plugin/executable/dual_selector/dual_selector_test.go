@@ -83,13 +83,13 @@ func TestSelector_Exec(t *testing.T) {
 	}
 	nextLateA := &dummyNext{
 		returnA:    true,
-		latencyA:   time.Millisecond * 1000,
+		latencyA:   time.Millisecond * 1500,
 		returnAAAA: true,
 	}
 	nextLateAAAA := &dummyNext{
 		returnA:     true,
 		returnAAAA:  true,
-		latencyAAAA: time.Millisecond * 1000,
+		latencyAAAA: time.Millisecond * 1500,
 	}
 
 	tests := []struct {

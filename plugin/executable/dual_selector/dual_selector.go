@@ -34,12 +34,12 @@ import (
 )
 
 const (
-	referenceWaitTimeout     = time.Millisecond * 500
+	referenceWaitTimeout     = time.Millisecond * 1200
 	defaultSubRoutineTimeout = time.Second * 5
 
 	// TODO: Make cache configurable?
 	cacheSize       = 64 * 1024
-	cacheTlt        = time.Hour
+	cacheTlt        = time.Hour * 12
 	cacheGcInterval = time.Minute
 )
 
