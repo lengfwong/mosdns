@@ -104,6 +104,7 @@ type Forward struct {
 	logger       *zap.Logger
 	us           []*upstreamWrapper
 	tag2Upstream map[string]*upstreamWrapper // for fast tag lookup only.
+	pluginTag    string
 }
 
 type Opts struct {
@@ -125,6 +126,7 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 		args:         args,
 		logger:       opt.Logger,
 		tag2Upstream: make(map[string]*upstreamWrapper),
+		pluginTag:    opt.MetricsTag,
 	}
 
 	applyGlobal := func(c *UpstreamConfig) {
@@ -256,6 +258,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	type res struct {
 		r   *dns.Msg
 		err error
+		u   *upstreamWrapper
 	}
 
 	resChan := make(chan res)
@@ -266,14 +269,14 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	for i := 0; i < concurrent; i++ {
 		u := us[(r+i)%len(us)]
 		qc := copyPayload(queryPayload)
-		go func(uqid uint32, question dns.Question) {
+		go func(uqid uint32, question dns.Question, chosenUpstream *upstreamWrapper) {
 			defer pool.ReleaseBuf(qc)
 			// Give each upstream a fixed timeout to finish the query.
 			upstreamCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 			defer cancel()
 
 			var r *dns.Msg
-			respPayload, err := u.ExchangeContext(upstreamCtx, *qc)
+			respPayload, err := chosenUpstream.ExchangeContext(upstreamCtx, *qc)
 			if err != nil {
 				f.logger.Warn(
 					"upstream error",
@@ -281,7 +284,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 					zap.String("qname", question.Name),
 					zap.Uint16("qclass", question.Qclass),
 					zap.Uint16("qtype", question.Qtype),
-					zap.String("upstream", u.name()),
+					zap.String("upstream", chosenUpstream.name()),
 					zap.Error(err),
 				)
 			} else {
@@ -293,16 +296,16 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 				}
 			}
 			select {
-			case resChan <- res{r: r, err: err}:
+			case resChan <- res{r: r, err: err, u: chosenUpstream}:
 			case <-done:
 			}
-		}(qCtx.Id(), qCtx.QQuestion())
+		}(qCtx.Id(), qCtx.QQuestion(), u)
 	}
 
 	for i := 0; i < concurrent; i++ {
 		select {
 		case res := <-resChan:
-			r, err := res.r, res.err
+			r, err, chosenUpstream := res.r, res.err, res.u
 			if err != nil {
 				continue
 			}
@@ -311,6 +314,25 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 			if i < concurrent-1 && r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
 				continue
 			}
+
+			if chosenUpstream != nil {
+				addr := chosenUpstream.cfg.Addr
+				proto := "UDP"
+				if strings.Contains(addr, "://") {
+					parts := strings.SplitN(addr, "://", 2)
+					proto = strings.ToUpper(parts[0])
+					addr = parts[1]
+				}
+				if proto == "TLS" {
+					proto = "DoT"
+				} else if proto == "HTTPS" {
+					proto = "DoH"
+				} else if proto == "QUIC" || proto == "DOQ" {
+					proto = "DoQ"
+				}
+				qCtx.SetUpstreamSelected(addr, proto, chosenUpstream.cfg.Tag, f.pluginTag)
+			}
+
 			return r, nil
 		case <-ctx.Done():
 			return nil, context.Cause(ctx)
