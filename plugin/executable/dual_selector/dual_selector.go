@@ -34,12 +34,12 @@ import (
 )
 
 const (
-	referenceWaitTimeout     = time.Millisecond * 500
+	referenceWaitTimeout     = time.Millisecond * 1200
 	defaultSubRoutineTimeout = time.Second * 5
 
 	// TODO: Make cache configurable?
 	cacheSize       = 64 * 1024
-	cacheTlt        = time.Hour
+	cacheTlt        = time.Hour * 12
 	cacheGcInterval = time.Minute
 )
 
@@ -161,8 +161,16 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 		case <-waitTimeoutTimer.C:
 			// We have been waiting the reference query for too long.
 			// Something may go wrong. We accept the original reply.
-			*qCtx = *qCtxOrg
-			return err
+			//*qCtx = *qCtxOrg
+			//return err
+			// Detection timeout: To completely prevent IPv6 leakage, AAAA will no longer be allowed; instead, an empty response will be.
+			s.L().Warn("dual_selector: reference query wait timeout, blocking non-preferred query to prevent leakage",
+				zap.String("query_name", string(qName)),
+				zap.Uint16("preferred_type", s.prefer),
+				)
+			r := dnsutils.GenEmptyReply(q, dns.RcodeSuccess)
+			qCtx.SetResponse(r)
+			return nil
 		}
 	}
 }
