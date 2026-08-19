@@ -52,8 +52,13 @@ func (r *Rotator) Write(p []byte) (n int, err error) {
 
 	writeLen := int64(len(p))
 	if r.MaxSize > 0 && r.size+writeLen > r.MaxSize {
-		if err := r.rotate(); err != nil {
-			return 0, err
+		if info, err := r.f.Stat(); err == nil {
+			r.size = info.Size()
+		}
+		if r.size+writeLen > r.MaxSize {
+			if err := r.rotate(); err != nil {
+				return 0, err
+			}
 		}
 	}
 
@@ -84,7 +89,7 @@ func (r *Rotator) openNew() error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(r.Filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(r.Filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0644)
 	if err != nil {
 		return err
 	}
