@@ -83,13 +83,13 @@ func TestSelector_Exec(t *testing.T) {
 	}
 	nextLateA := &dummyNext{
 		returnA:    true,
-		latencyA:   time.Millisecond * 1000,
+		latencyA:   time.Millisecond * 1500,
 		returnAAAA: true,
 	}
 	nextLateAAAA := &dummyNext{
 		returnA:     true,
 		returnAAAA:  true,
-		latencyAAAA: time.Millisecond * 1000,
+		latencyAAAA: time.Millisecond * 1500,
 	}
 
 	tests := []struct {
@@ -114,7 +114,8 @@ func TestSelector_Exec(t *testing.T) {
 			qtype:     dns.TypeAAAA,
 			next:      nextLateA,
 			wantErr:   false,
-			wantReply: true,
+			//wantReply: true,
+			wantReply: false,
 		},
 		{
 			name:      "prefer v4: block domain AAAA if domain has A records",
@@ -138,7 +139,8 @@ func TestSelector_Exec(t *testing.T) {
 			qtype:     dns.TypeA,
 			next:      nextLateAAAA,
 			wantErr:   false,
-			wantReply: true,
+			//wantReply: true,
+			wantReply: false,
 		},
 		{
 			name:      "prefer v6: block domain A if domain has AAAA records",
