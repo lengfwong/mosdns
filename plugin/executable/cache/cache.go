@@ -27,6 +27,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -69,15 +70,22 @@ const (
 var _ sequence.RecursiveExecutable = (*Cache)(nil)
 
 type Args struct {
-	Size         int    `yaml:"size"`
-	LazyCacheTTL int    `yaml:"lazy_cache_ttl"`
-	DumpFile     string `yaml:"dump_file"`
-	DumpInterval int    `yaml:"dump_interval"`
+	Size                 int    `yaml:"size"`
+	LazyCacheTTL         int    `yaml:"lazy_cache_ttl"`
+	DumpFile             string `yaml:"dump_file"`
+	DumpInterval         int    `yaml:"dump_interval"`
+	Prefetch             bool   `yaml:"prefetch"`
+	PrefetchBeforeExpire int    `yaml:"prefetch_before_expire"`
+	PrefetchMinHits      int    `yaml:"prefetch_min_hits"`
+	PrefetchScanInterval int    `yaml:"prefetch_scan_interval"`
 }
 
 func (a *Args) init() {
 	utils.SetDefaultUnsignNum(&a.Size, 1024)
 	utils.SetDefaultUnsignNum(&a.DumpInterval, 600)
+	utils.SetDefaultUnsignNum(&a.PrefetchBeforeExpire, 10)
+	utils.SetDefaultUnsignNum(&a.PrefetchMinHits, 3)
+	utils.SetDefaultUnsignNum(&a.PrefetchScanInterval, 5)
 }
 
 type Cache struct {
@@ -94,6 +102,11 @@ type Cache struct {
 	hitTotal     prometheus.Counter
 	lazyHitTotal prometheus.Counter
 	size         prometheus.GaugeFunc
+
+	prefetchTotal     prometheus.Counter
+	prefetchFailTotal prometheus.Counter
+	capturedNext      *sequence.ChainWalker
+	captureOnce       sync.Once
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -160,6 +173,16 @@ func NewCache(args *Args, opts Opts) *Cache {
 			Help:        "The total number of queries that hit the expired cache",
 			ConstLabels: lb,
 		}),
+		prefetchTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name:        "prefetch_total",
+			Help:        "The total number of successful proactive prefetch operations",
+			ConstLabels: lb,
+		}),
+		prefetchFailTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name:        "prefetch_fail_total",
+			Help:        "The total number of failed proactive prefetch operations",
+			ConstLabels: lb,
+		}),
 		size: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name:        "size_current",
 			Help:        "Current cache size in records",
@@ -173,12 +196,15 @@ func NewCache(args *Args, opts Opts) *Cache {
 		p.logger.Error("failed to load cache dump", zap.Error(err))
 	}
 	p.startDumpLoop()
+	if p.args.Prefetch {
+		p.startPrefetchLoop()
+	}
 
 	return p
 }
 
 func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
-	for _, collector := range [...]prometheus.Collector{c.queryTotal, c.hitTotal, c.lazyHitTotal, c.size} {
+	for _, collector := range [...]prometheus.Collector{c.queryTotal, c.hitTotal, c.lazyHitTotal, c.prefetchTotal, c.prefetchFailTotal, c.size} {
 		if err := r.Register(collector); err != nil {
 			return err
 		}
@@ -187,6 +213,15 @@ func (c *Cache) RegMetricsTo(r prometheus.Registerer) error {
 }
 
 func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
+	c.captureOnce.Do(func() {
+		// This implementation assumes the cache plugin is invoked from a single fixed position in the sequence.
+		nextCopy := next
+		c.capturedNext = &nextCopy
+	})
+	if c.capturedNext != nil && !reflect.DeepEqual(next, *c.capturedNext) {
+		c.logger.Warn("cache plugin Exec called with a different next chain than first time")
+	}
+
 	c.queryTotal.Inc()
 	q := qCtx.Q()
 
@@ -205,6 +240,7 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		cachedResp.Id = q.Id // change msg id
 		qCtx.SetResponse(cachedResp)
 		if v, _, ok := c.backend.Get(key(msgKey)); ok && v != nil {
+			v.hitCount.Add(1)
 			ttl := int(v.expirationTime.Sub(v.storedTime).Seconds())
 			remainingTtl := int(v.expirationTime.Sub(time.Now()).Seconds())
 			if remainingTtl < 0 {
@@ -253,6 +289,73 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 		return nil, nil
 	}
 	c.lazyUpdateSF.DoChan(msgKey, lazyUpdateFunc) // DoChan won't block this goroutine
+}
+
+func (c *Cache) startPrefetchLoop() {
+	go func() {
+		ticker := time.NewTicker(time.Duration(c.args.PrefetchScanInterval) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if c.capturedNext == nil {
+					continue
+				}
+				now := time.Now()
+				_ = c.backend.Range(func(k key, v *item, cacheExpirationTime time.Time) error {
+					remainingTTL := int(v.expirationTime.Sub(now).Seconds())
+					if remainingTTL >= 0 && remainingTTL < c.args.PrefetchBeforeExpire && v.hitCount.Load() >= uint32(c.args.PrefetchMinHits) {
+						c.doPrefetch(string(k), v, remainingTTL)
+					}
+					return nil
+				})
+			case <-c.closeNotify:
+				return
+			}
+		}
+	}()
+}
+
+func (c *Cache) doPrefetch(msgKey string, v *item, remainingTTL int) {
+	prefetchFunc := func() (any, error) {
+		defer c.lazyUpdateSF.Forget(msgKey)
+
+		req := new(dns.Msg)
+		req.SetQuestion(v.resp.Question[0].Name, v.resp.Question[0].Qtype)
+		req.Id = dns.Id()
+		req.RecursionDesired = true
+		newQCtx := query_context.NewContext(req)
+
+		qname := v.resp.Question[0].Name
+		hitCount := v.hitCount.Load()
+
+		c.logger.Debug("start proactive prefetch",
+			zap.String("qname", qname),
+			zap.Uint32("hit_count", hitCount),
+			zap.Int("remaining_ttl", remainingTTL),
+		)
+		ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
+		defer cancel()
+
+		err := c.capturedNext.ExecNext(ctx, newQCtx)
+		if err != nil {
+			c.logger.Warn("failed to proactive prefetch", zap.String("qname", qname), zap.Error(err))
+			c.prefetchFailTotal.Inc()
+			return nil, err
+		}
+
+		r := newQCtx.R()
+		if r != nil {
+			if saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL) {
+				v.hitCount.Store(0)
+				c.prefetchTotal.Inc()
+				c.updatedKey.Add(1)
+			}
+		}
+		c.logger.Debug("proactive prefetch updated", zap.String("qname", qname), newQCtx.InfoField())
+		return nil, nil
+	}
+	c.lazyUpdateSF.DoChan(msgKey, prefetchFunc)
 }
 
 func (c *Cache) Close() error {
