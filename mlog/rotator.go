@@ -185,7 +185,7 @@ func (r *Rotator) Close() error {
 // Supports K, M, G, T units. If no unit, defaults to M.
 func ParseSize(s string) (int64, error) {
 	if s == "" {
-		return 1024 * 1024, nil // Default 1M
+		return 5 * 1024 * 1024, nil // Default 5M
 	}
 	s = strings.ToUpper(strings.TrimSpace(s))
 
