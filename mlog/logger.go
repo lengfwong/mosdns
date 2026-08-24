@@ -39,11 +39,11 @@ type LogConfig struct {
 	// Production enables json output.
 	Production bool `yaml:"production"`
 
-	// Size of log file limit. Default is 1M.
+	// Size of log file limit. Default is 5M.
 	// Supported units: K, M, G, T. If no unit, defaults to M.
 	Size string `yaml:"size"`
 
-	// Max number of old log files to retain. Default is 3.
+	// Max number of old log files to retain. Default is 0.
 	// Set to a negative number to retain all files.
 	Backups int `yaml:"backups"`
 }
@@ -82,9 +82,6 @@ func NewLogger(lc LogConfig) (*zap.Logger, error) {
 		}
 
 		backups := lc.Backups
-		if backups == 0 {
-			backups = 3
-		}
 
 		rotator := &Rotator{
 			Filename:   lf,
