@@ -20,7 +20,7 @@ PKG_BUILD_FLAGS:=no-mips16
 
 #GO_PKG:与go.mod一致
 GO_PKG:=github.com/IrineSistiana/mosdns/v5
-GO_PKG_LDFLAGS_X:=main.version=v$(PKG_VERSION)-$(PKG_RELEASE)
+GO_PKG_LDFLAGS_X:=main.version=v$(PKG_VERSION)-r$(PKG_RELEASE)
 
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/golang/golang-package.mk
