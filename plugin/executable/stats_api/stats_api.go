@@ -259,7 +259,15 @@ func (t *TopStats) GetTop(limit int) ([]TopItem, []TopItem, []TopItem) {
 	if limit <= 0 {
 		limit = 10
 	}
-	topDomains := getSortedTop(t.topDomains, false, limit)
+
+	cleanTopDomains := make(map[string]uint64, len(t.topDomains))
+	for domain, count := range t.topDomains {
+		if _, isBlocked := t.topBlocked[domain]; !isBlocked {
+			cleanTopDomains[domain] = count
+		}
+	}
+
+	topDomains := getSortedTop(cleanTopDomains, false, limit)
 	topClients := getSortedTop(t.topClients, true, limit)
 	topBlocked := getSortedTop(t.topBlocked, false, limit)
 	return topDomains, topClients, topBlocked
@@ -614,7 +622,7 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 			status = fmt.Sprintf("RCODE%d", r.Rcode)
 		}
 
-		if r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused {
+		if (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused) && qQuestion.Qtype != dns.TypeHTTPS {
 			isBlocked = true
 		}
 

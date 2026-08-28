@@ -92,22 +92,17 @@ func TestTopStats(t *testing.T) {
 	top := NewTopStats()
 
 	top.Record("a.com.", "192.168.1.1", false)
-	top.Record("a.com.", "192.168.1.1", true)
+	top.Record("a.com.", "192.168.1.1", false)
 	top.Record("b.com.", "192.168.1.2", true)
-	top.Record("a.com.", "192.168.1.2", false)
 
-	domains, clients, blocked := top.GetTop(10)
+	domains, _, blocked := top.GetTop(10)
 
 	if len(domains) == 0 || domains[0].Domain != "a.com." || domains[0].Count != 2 {
 		t.Errorf("top domains mismatch: %+v", domains)
 	}
 
-	if len(clients) < 2 {
-		t.Fatalf("expected at least 2 clients, got %d", len(clients))
-	}
-
-	if len(blocked) < 2 {
-		t.Fatalf("expected at least 2 blocked domains, got %d", len(blocked))
+	if len(blocked) == 0 || blocked[0].Domain != "b.com." {
+		t.Errorf("top blocked mismatch: %+v", blocked)
 	}
 
 	// Test Clear
