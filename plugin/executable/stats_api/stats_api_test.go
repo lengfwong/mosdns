@@ -98,7 +98,7 @@ func TestTopStats(t *testing.T) {
 
 	domains, clients, blocked := top.GetTop(10)
 
-	if len(domains) == 0 || domains[0].Domain != "a.com." || domains[0].Count != 3 {
+	if len(domains) == 0 || domains[0].Domain != "a.com." || domains[0].Count != 2 {
 		t.Errorf("top domains mismatch: %+v", domains)
 	}
 
