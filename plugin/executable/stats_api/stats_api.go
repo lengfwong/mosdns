@@ -200,13 +200,14 @@ func (t *TopStats) Record(domain, clientIP string, isBlocked bool) {
 	defer t.mu.Unlock()
 
 	if domain != "" {
-		t.topDomains[domain]++
+		if isBlocked {
+			t.topBlocked[domain]++
+		} else {
+			t.topDomains[domain]++
+		}
 	}
 	if clientIP != "" {
 		t.topClients[clientIP]++
-	}
-	if isBlocked && domain != "" {
-		t.topBlocked[domain]++
 	}
 }
 
