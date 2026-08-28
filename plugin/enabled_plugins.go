@@ -62,6 +62,7 @@ import (
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence/fallback"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/sleep"
+	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/stats_api"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/ttl"
 	_ "github.com/IrineSistiana/mosdns/v5/plugin/executable/remove_cname"
 
