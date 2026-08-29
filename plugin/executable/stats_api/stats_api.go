@@ -24,8 +24,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,13 +37,18 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/go-chi/chi/v5"
+	"github.com/klauspost/compress/gzip"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )
 
-const PluginType = "stats_api"
+const (
+	PluginType      = "stats_api"
+	statsDumpHeader = "mosdns_stats_v1"
+)
 
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
@@ -51,14 +58,17 @@ func init() {
 var _ sequence.RecursiveExecutable = (*StatsAPI)(nil)
 
 type Args struct {
-	Listen   string `yaml:"listen"`
-	Capacity int    `yaml:"capacity"`
+	Listen       string `yaml:"listen"`
+	Capacity     int    `yaml:"capacity"`
+	DumpFile     string `yaml:"dump_file"`
+	DumpInterval int    `yaml:"dump_interval"`
 }
 
 func (a *Args) init() {
 	if a.Capacity <= 0 {
 		a.Capacity = 2000
 	}
+	utils.SetDefaultUnsignNum(&a.DumpInterval, 600)
 }
 
 type AnswerDTO struct {
@@ -174,6 +184,42 @@ func (r *RingBuffer) QueryLogs(limit, offset int, search, filter string) (int, [
 	return total, filtered[offset:end]
 }
 
+// Export returns logs in chronological order (oldest first) and current seqID.
+func (r *RingBuffer) Export() ([]LogEntry, uint64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	entries := make([]LogEntry, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		idx := (r.head - r.count + i + r.capacity) % r.capacity
+		entries = append(entries, r.buf[idx])
+	}
+	return entries, r.seqID
+}
+
+// Import restores logs into ring buffer adapting to current capacity.
+func (r *RingBuffer) Import(entries []LogEntry, seqID uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.buf = make([]LogEntry, r.capacity)
+	r.head = 0
+	r.count = 0
+	r.seqID = seqID
+
+	start := 0
+	if len(entries) > r.capacity {
+		start = len(entries) - r.capacity
+	}
+	for i := start; i < len(entries); i++ {
+		r.buf[r.head] = entries[i]
+		r.head = (r.head + 1) % r.capacity
+		if r.count < r.capacity {
+			r.count++
+		}
+	}
+}
+
 type TopItem struct {
 	Domain   string `json:"domain,omitempty"`
 	ClientIP string `json:"client_ip,omitempty"`
@@ -218,6 +264,43 @@ func (t *TopStats) Clear() {
 	t.topDomains = make(map[string]uint64)
 	t.topClients = make(map[string]uint64)
 	t.topBlocked = make(map[string]uint64)
+}
+
+func (t *TopStats) Export() (map[string]uint64, map[string]uint64, map[string]uint64) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	domains := make(map[string]uint64, len(t.topDomains))
+	for k, v := range t.topDomains {
+		domains[k] = v
+	}
+	clients := make(map[string]uint64, len(t.topClients))
+	for k, v := range t.topClients {
+		clients[k] = v
+	}
+	blocked := make(map[string]uint64, len(t.topBlocked))
+	for k, v := range t.topBlocked {
+		blocked[k] = v
+	}
+	return domains, clients, blocked
+}
+
+func (t *TopStats) Import(domains, clients, blocked map[string]uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.topDomains = make(map[string]uint64, len(domains))
+	for k, v := range domains {
+		t.topDomains[k] = v
+	}
+	t.topClients = make(map[string]uint64, len(clients))
+	for k, v := range clients {
+		t.topClients[k] = v
+	}
+	t.topBlocked = make(map[string]uint64, len(blocked))
+	for k, v := range blocked {
+		t.topBlocked[k] = v
+	}
 }
 
 func getSortedTop(m map[string]uint64, isClient bool, limit int) []TopItem {
@@ -284,6 +367,12 @@ type HistoryBucket struct {
 	Total   atomic.Uint64
 	Blocked atomic.Uint64
 	Cached  atomic.Uint64
+}
+
+type HistoryBucketData struct {
+	Total   uint64 `json:"total"`
+	Blocked uint64 `json:"blocked"`
+	Cached  uint64 `json:"cached"`
 }
 
 type HistoryStats struct {
@@ -362,6 +451,55 @@ func (h *HistoryStats) GetHistory(numPoints int) []HistoryPoint {
 	return res
 }
 
+func (h *HistoryStats) Export() map[int64]HistoryBucketData {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	res := make(map[int64]HistoryBucketData, len(h.points))
+	for k, v := range h.points {
+		if v != nil {
+			res[k] = HistoryBucketData{
+				Total:   v.Total.Load(),
+				Blocked: v.Blocked.Load(),
+				Cached:  v.Cached.Load(),
+			}
+		}
+	}
+	return res
+}
+
+func (h *HistoryStats) Import(points map[int64]HistoryBucketData) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.points = make(map[int64]*HistoryBucket, len(points))
+	cutoff := time.Now().UTC().Add(-48 * time.Hour).Unix()
+	for k, v := range points {
+		if k >= cutoff {
+			bucket := &HistoryBucket{}
+			bucket.Total.Store(v.Total)
+			bucket.Blocked.Store(v.Blocked)
+			bucket.Cached.Store(v.Cached)
+			h.points[k] = bucket
+		}
+	}
+}
+
+type StatsDumpData struct {
+	Version        int                         `json:"version"`
+	Timestamp      int64                       `json:"timestamp"`
+	TotalQueries   uint64                      `json:"total_queries"`
+	BlockedQueries uint64                      `json:"blocked_queries"`
+	CachedQueries  uint64                      `json:"cached_queries"`
+	TotalLatencyUs uint64                      `json:"total_latency_us"`
+	TopDomains     map[string]uint64           `json:"top_domains,omitempty"`
+	TopClients     map[string]uint64           `json:"top_clients,omitempty"`
+	TopBlocked     map[string]uint64           `json:"top_blocked,omitempty"`
+	History        map[int64]HistoryBucketData `json:"history,omitempty"`
+	Logs           []LogEntry                  `json:"logs,omitempty"`
+	SeqID          uint64                      `json:"seq_id,omitempty"`
+}
+
 type StatsAPI struct {
 	args   *Args
 	logger *zap.Logger
@@ -375,8 +513,10 @@ type StatsAPI struct {
 	cachedQueries  atomic.Uint64
 	totalLatencyUs atomic.Uint64
 
-	httpServer *http.Server
-	closeOnce  sync.Once
+	updatedCount atomic.Uint64
+	closeNotify  chan struct{}
+	httpServer   *http.Server
+	closeOnce    sync.Once
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
@@ -390,6 +530,8 @@ func QuickSetup(bq sequence.BQ, s string) (any, error) {
 	fields := strings.Fields(s)
 	listen := ""
 	capacity := 2000
+	dumpFile := ""
+	dumpInterval := 600
 	if len(fields) > 0 {
 		listen = fields[0]
 	}
@@ -398,7 +540,20 @@ func QuickSetup(bq sequence.BQ, s string) (any, error) {
 			capacity = c
 		}
 	}
-	return NewStatsAPI(&Args{Listen: listen, Capacity: capacity}, bq.L()), nil
+	if len(fields) > 2 {
+		dumpFile = fields[2]
+	}
+	if len(fields) > 3 {
+		if d, err := strconv.Atoi(fields[3]); err == nil && d > 0 {
+			dumpInterval = d
+		}
+	}
+	return NewStatsAPI(&Args{
+		Listen:       listen,
+		Capacity:     capacity,
+		DumpFile:     dumpFile,
+		DumpInterval: dumpInterval,
+	}, bq.L()), nil
 }
 
 func NewStatsAPI(args *Args, logger *zap.Logger) *StatsAPI {
@@ -412,7 +567,13 @@ func NewStatsAPI(args *Args, logger *zap.Logger) *StatsAPI {
 		ringBuffer:   NewRingBuffer(args.Capacity),
 		topStats:     NewTopStats(),
 		historyStats: NewHistoryStats(),
+		closeNotify:  make(chan struct{}),
 	}
+
+	if err := s.loadDump(); err != nil {
+		s.logger.Error("failed to load stats dump", zap.Error(err))
+	}
+	s.startDumpLoop()
 
 	if len(args.Listen) > 0 {
 		srv := &http.Server{
@@ -450,6 +611,8 @@ func (s *StatsAPI) Router() *chi.Mux {
 	r.Get("/api/v1/logs", s.handleLogs)
 	r.Get("/api/v1/top", s.handleTop)
 	r.Get("/api/v1/history", s.handleHistory)
+	r.Get("/api/v1/dump", s.handleDump)
+	r.Post("/api/v1/load_dump", s.handleLoadDump)
 	r.Post("/api/v1/logs/clear", s.handleClearLogs)
 	r.Post("/api/v1/cache/clear", s.handleClearCache)
 
@@ -560,9 +723,27 @@ func (s *StatsAPI) handleHistory(w http.ResponseWriter, req *http.Request) {
 	})
 }
 
+func (s *StatsAPI) handleDump(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if err := s.writeDump(w); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func (s *StatsAPI) handleLoadDump(w http.ResponseWriter, req *http.Request) {
+	if err := s.readDump(req.Body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.updatedCount.Add(1)
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *StatsAPI) handleClearLogs(w http.ResponseWriter, req *http.Request) {
 	s.ringBuffer.Clear()
 	s.topStats.Clear()
+	s.updatedCount.Add(1)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -579,6 +760,122 @@ func (s *StatsAPI) handleClearCache(w http.ResponseWriter, req *http.Request) {
 	})
 }
 
+func (s *StatsAPI) writeDump(w io.Writer) error {
+	gw, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+	if err != nil {
+		return err
+	}
+	gw.Name = statsDumpHeader
+
+	data := StatsDumpData{
+		Version:        1,
+		Timestamp:      time.Now().Unix(),
+		TotalQueries:   s.totalQueries.Load(),
+		BlockedQueries: s.blockedQueries.Load(),
+		CachedQueries:  s.cachedQueries.Load(),
+		TotalLatencyUs: s.totalLatencyUs.Load(),
+	}
+
+	data.TopDomains, data.TopClients, data.TopBlocked = s.topStats.Export()
+	data.History = s.historyStats.Export()
+	data.Logs, data.SeqID = s.ringBuffer.Export()
+
+	if err := json.NewEncoder(gw).Encode(&data); err != nil {
+		_ = gw.Close()
+		return fmt.Errorf("failed to encode stats dump: %w", err)
+	}
+
+	return gw.Close()
+}
+
+func (s *StatsAPI) readDump(r io.Reader) error {
+	gr, err := gzip.NewReader(r)
+	if err != nil {
+		return fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer gr.Close()
+
+	if gr.Name != statsDumpHeader {
+		return fmt.Errorf("invalid stats dump header: got %s, want %s", gr.Name, statsDumpHeader)
+	}
+
+	var data StatsDumpData
+	if err := json.NewDecoder(gr).Decode(&data); err != nil {
+		return fmt.Errorf("failed to decode stats dump: %w", err)
+	}
+
+	s.totalQueries.Store(data.TotalQueries)
+	s.blockedQueries.Store(data.BlockedQueries)
+	s.cachedQueries.Store(data.CachedQueries)
+	s.totalLatencyUs.Store(data.TotalLatencyUs)
+
+	s.topStats.Import(data.TopDomains, data.TopClients, data.TopBlocked)
+	s.historyStats.Import(data.History)
+	s.ringBuffer.Import(data.Logs, data.SeqID)
+
+	return nil
+}
+
+func (s *StatsAPI) loadDump() error {
+	if len(s.args.DumpFile) == 0 {
+		return nil
+	}
+	f, err := os.Open(s.args.DumpFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.logger.Info("stats dump file does not exist, starting with empty stats", zap.String("file", s.args.DumpFile))
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	if err := s.readDump(f); err != nil {
+		return err
+	}
+	s.logger.Info("stats dump loaded successfully", zap.String("file", s.args.DumpFile))
+	return nil
+}
+
+func (s *StatsAPI) dumpStats() error {
+	if len(s.args.DumpFile) == 0 {
+		return nil
+	}
+	f, err := os.Create(s.args.DumpFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := s.writeDump(f); err != nil {
+		return fmt.Errorf("failed to write stats dump, %w", err)
+	}
+	s.logger.Info("stats dumped successfully", zap.String("file", s.args.DumpFile))
+	return nil
+}
+
+func (s *StatsAPI) startDumpLoop() {
+	if len(s.args.DumpFile) == 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(time.Duration(s.args.DumpInterval) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if s.updatedCount.Swap(0) > 0 {
+					if err := s.dumpStats(); err != nil {
+						s.logger.Error("failed to dump stats", zap.Error(err))
+					}
+				}
+			case <-s.closeNotify:
+				return
+			}
+		}
+	}()
+}
+
 func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
 	start := time.Now()
 	err := next.ExecNext(ctx, qCtx)
@@ -586,6 +883,7 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 
 	s.totalQueries.Add(1)
 	s.totalLatencyUs.Add(uint64(elapsed.Microseconds()))
+	s.updatedCount.Add(1)
 
 	var clientIP string
 	if clientAddr := qCtx.ServerMeta.ClientAddr; clientAddr.IsValid() {
@@ -725,6 +1023,10 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 
 func (s *StatsAPI) Close() error {
 	s.closeOnce.Do(func() {
+		close(s.closeNotify)
+		if err := s.dumpStats(); err != nil {
+			s.logger.Error("failed to dump stats on close", zap.Error(err))
+		}
 		if s.httpServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
