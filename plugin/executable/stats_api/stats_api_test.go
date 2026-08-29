@@ -381,8 +381,8 @@ func TestStatsAPIExec(t *testing.T) {
 	if logs[0].Domain != "google.com." {
 		t.Errorf("expected domain google.com., got %s", logs[0].Domain)
 	}
-	if logs[0].Upstream != "UDP://8.8.8.8:53" {
-		t.Errorf("expected upstream UDP://8.8.8.8:53, got %s", logs[0].Upstream)
+	if logs[0].Upstream != "8.8.8.8:53" {
+		t.Errorf("expected upstream 8.8.8.8:53, got %s", logs[0].Upstream)
 	}
 	if logs[0].Rule != "qname google.com." {
 		t.Errorf("expected rule qname google.com., got %s", logs[0].Rule)
