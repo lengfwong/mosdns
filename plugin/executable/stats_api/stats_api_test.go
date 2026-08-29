@@ -215,6 +215,15 @@ func TestHistoryStats(t *testing.T) {
 	if lastPoint.Total != 3 || lastPoint.Blocked != 1 || lastPoint.Cached != 1 {
 		t.Errorf("history point mismatch: %+v", lastPoint)
 	}
+
+	parsedTime, err := time.Parse(time.RFC3339, lastPoint.Time)
+	if err != nil {
+		t.Fatalf("failed to parse history point time: %v", err)
+	}
+	expectedHour := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+	if parsedTime.Unix() != expectedHour.Unix() {
+		t.Errorf("expected history point time unix %d, got %d", expectedHour.Unix(), parsedTime.Unix())
+	}
 }
 
 func TestHistoryStatsExportImport(t *testing.T) {
