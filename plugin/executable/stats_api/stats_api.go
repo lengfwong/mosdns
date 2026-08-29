@@ -970,10 +970,20 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	if isCached {
 		upstream = "cache"
 	} else if u := qCtx.UpstreamSelected; u != nil {
-		if u.Protocol != "" && u.Addr != "" {
-			upstream = fmt.Sprintf("%s://%s", u.Protocol, u.Addr)
-		} else if u.Addr != "" {
-			upstream = u.Addr
+		if u.Addr != "" {
+			if !strings.Contains(u.Addr, "://") {
+				if u.Protocol == "DoH" {
+					upstream = "https://" + u.Addr
+				} else if u.Protocol == "DoT" {
+					upstream = "tls://" + u.Addr
+				} else if u.Protocol == "DoQ" {
+					upstream = "quic://" + u.Addr
+				} else {
+					upstream = u.Addr
+				}
+			} else {
+				upstream = u.Addr
+			}
 		} else if u.Tag != "" {
 			upstream = u.Tag
 		}
@@ -981,19 +991,43 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 
 	// Extract Rule information
 	var rule string
-	if len(qCtx.RuleHits) > 0 {
-		for i := len(qCtx.RuleHits) - 1; i >= 0; i-- {
-			hit := qCtx.RuleHits[i]
-			if len(hit.Matches) > 0 {
-				rule = strings.Join(hit.Matches, ",")
-				break
-			} else if hit.Exec != "" {
-				rule = hit.Exec
-				break
-			} else if hit.Sequence != "" {
-				rule = hit.Sequence
-				break
+	for i := len(qCtx.RuleHits) - 1; i >= 0; i-- {
+		hit := qCtx.RuleHits[i]
+		exec := strings.TrimSpace(hit.Exec)
+
+		if exec == "accept" || exec == "return" || strings.HasPrefix(exec, "jump ") || strings.HasPrefix(exec, "ttl ") {
+			continue
+		}
+
+		var positiveMatches []string
+		for _, m := range hit.Matches {
+			m = strings.TrimSpace(m)
+			if m != "" && m != "has_resp" && !strings.HasPrefix(m, "!") {
+				positiveMatches = append(positiveMatches, m)
 			}
+		}
+
+		if len(positiveMatches) > 0 {
+			rule = strings.Join(positiveMatches, ",")
+			break
+		}
+
+		if exec != "" && exec != "$stats_collector" {
+			rule = exec
+			break
+		}
+
+		if hit.Sequence != "" && hit.Sequence != "has_resp_sequence" && hit.Sequence != "main_sequence" {
+			rule = hit.Sequence
+			break
+		}
+	}
+
+	if rule == "" {
+		if isCached {
+			rule = "cache"
+		} else {
+			rule = "-"
 		}
 	}
 

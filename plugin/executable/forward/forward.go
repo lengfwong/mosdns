@@ -330,7 +330,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 				} else if proto == "QUIC" || proto == "DOQ" {
 					proto = "DoQ"
 				}
-				qCtx.SetUpstreamSelected(addr, proto, chosenUpstream.cfg.Tag, f.pluginTag)
+				qCtx.SetUpstreamSelected(chosenUpstream.cfg.Addr, proto, chosenUpstream.cfg.Tag, f.pluginTag)
 			}
 
 			return r, nil
