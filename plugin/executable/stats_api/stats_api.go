@@ -387,7 +387,7 @@ func NewHistoryStats() *HistoryStats {
 }
 
 func (h *HistoryStats) Record(t time.Time, isBlocked, isCached bool) {
-	tHour := t.UTC().Truncate(time.Hour).Unix()
+	tHour := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location()).Unix()
 
 	h.mu.RLock()
 	bucket, ok := h.points[tHour]
@@ -401,7 +401,7 @@ func (h *HistoryStats) Record(t time.Time, isBlocked, isCached bool) {
 			h.points[tHour] = bucket
 
 			// Clean up old buckets beyond 48 hours
-			cutoff := t.UTC().Add(-48 * time.Hour).Unix()
+			cutoff := t.Add(-48 * time.Hour).Unix()
 			for k := range h.points {
 				if k < cutoff {
 					delete(h.points, k)
@@ -424,14 +424,15 @@ func (h *HistoryStats) GetHistory(numPoints int) []HistoryPoint {
 	if numPoints <= 0 {
 		numPoints = 24
 	}
-	now := time.Now().UTC().Truncate(time.Hour)
+	now := time.Now()
+	nowHour := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
 	res := make([]HistoryPoint, 0, numPoints)
 
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	for i := numPoints - 1; i >= 0; i-- {
-		slotTime := now.Add(time.Duration(-i) * time.Hour)
+		slotTime := nowHour.Add(time.Duration(-i) * time.Hour)
 		slotUnix := slotTime.Unix()
 
 		var total, blocked, cached uint64
@@ -473,7 +474,7 @@ func (h *HistoryStats) Import(points map[int64]HistoryBucketData) {
 	defer h.mu.Unlock()
 
 	h.points = make(map[int64]*HistoryBucket, len(points))
-	cutoff := time.Now().UTC().Add(-48 * time.Hour).Unix()
+	cutoff := time.Now().Add(-48 * time.Hour).Unix()
 	for k, v := range points {
 		if k >= cutoff {
 			bucket := &HistoryBucket{}
@@ -1037,7 +1038,7 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	elapsedMS := math.Round(float64(elapsed.Microseconds())/10.0) / 100.0
 
 	entry := LogEntry{
-		Timestamp: start.UTC().Format(time.RFC3339),
+		Timestamp: start.Format(time.RFC3339),
 		ClientIP:  clientIP,
 		Domain:    domain,
 		QType:     qtypeStr,
