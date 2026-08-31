@@ -511,3 +511,37 @@ func TestStatsAPINonExistentDumpFile(t *testing.T) {
 		t.Errorf("expected 0 total queries, got %d", s.totalQueries.Load())
 	}
 }
+
+func TestStatsAPICachedPercentageExcludesBlocked(t *testing.T) {
+	s := NewStatsAPI(&Args{Capacity: 100}, zap.NewNop())
+	router := s.Router()
+
+	// 100 total queries: 50 blocked, 25 cached, 25 forwarded to upstream
+	s.totalQueries.Store(100)
+	s.blockedQueries.Store(50)
+	s.cachedQueries.Store(25)
+	s.totalLatencyUs.Store(50000)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+
+	var statsResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &statsResp); err != nil {
+		t.Fatalf("failed to unmarshal stats response: %v", err)
+	}
+
+	// blocked_percentage = 50 / 100 = 50%
+	if blockedPct := statsResp["blocked_percentage"].(float64); blockedPct != 50.0 {
+		t.Errorf("expected blocked_percentage 50.0, got %v", blockedPct)
+	}
+
+	// cached_percentage = 25 / (100 - 50) = 50% (previously 25%)
+	if cachedPct := statsResp["cached_percentage"].(float64); cachedPct != 50.0 {
+		t.Errorf("expected cached_percentage 50.0, got %v", cachedPct)
+	}
+}
