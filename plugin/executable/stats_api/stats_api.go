@@ -629,8 +629,13 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 	var blockedPct, cachedPct, avgLat float64
 	if total > 0 {
 		blockedPct = float64(blocked) / float64(total) * 100.0
-		cachedPct = float64(cached) / float64(total) * 100.0
 		avgLat = (float64(latUs) / float64(total)) / 1000.0
+	}
+	if total > blocked {
+		cachedPct = float64(cached) / float64(total-blocked) * 100.0
+		if cachedPct > 100.0 {
+			cachedPct = 100.0
+		}
 	}
 
 	blockedPct = math.Round(blockedPct*100) / 100
