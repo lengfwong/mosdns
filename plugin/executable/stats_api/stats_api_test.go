@@ -281,6 +281,9 @@ func TestStatsAPIHTTPEndpoints(t *testing.T) {
 	if statsResp["total_queries"].(float64) != 1 {
 		t.Errorf("expected total_queries 1, got %v", statsResp["total_queries"])
 	}
+	if _, ok := statsResp["qps"]; !ok {
+		t.Errorf("expected qps field in stats response")
+	}
 
 	// Test GET /api/v1/history
 	reqHist := httptest.NewRequest(http.MethodGet, "/api/v1/history?points=24", nil)
@@ -543,5 +546,25 @@ func TestStatsAPICachedPercentageExcludesBlocked(t *testing.T) {
 	// cached_percentage = 25 / (100 - 50) = 50% (previously 25%)
 	if cachedPct := statsResp["cached_percentage"].(float64); cachedPct != 50.0 {
 		t.Errorf("expected cached_percentage 50.0, got %v", cachedPct)
+	}
+}
+
+func TestStatsAPIQPS(t *testing.T) {
+	s := NewStatsAPI(&Args{Capacity: 100}, zap.NewNop())
+	defer s.Close()
+
+	// Initially QPS is 0
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	w := httptest.NewRecorder()
+	s.Router().ServeHTTP(w, req)
+
+	var statsResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &statsResp); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if qps, ok := statsResp["qps"]; !ok {
+		t.Fatalf("expected qps field in stats response")
+	} else if qps.(float64) != 0 {
+		t.Errorf("expected initial qps 0, got %v", qps)
 	}
 }

@@ -513,6 +513,7 @@ type StatsAPI struct {
 	blockedQueries atomic.Uint64
 	cachedQueries  atomic.Uint64
 	totalLatencyUs atomic.Uint64
+	currentQPS     atomic.Uint64
 
 	updatedCount atomic.Uint64
 	closeNotify  chan struct{}
@@ -575,6 +576,7 @@ func NewStatsAPI(args *Args, logger *zap.Logger) *StatsAPI {
 		s.logger.Error("failed to load stats dump", zap.Error(err))
 	}
 	s.startDumpLoop()
+	s.startQPSLoop()
 
 	if len(args.Listen) > 0 {
 		srv := &http.Server{
@@ -641,6 +643,7 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 	blockedPct = math.Round(blockedPct*100) / 100
 	cachedPct = math.Round(cachedPct*100) / 100
 	avgLat = math.Round(avgLat*100) / 100
+	qps := s.currentQPS.Load()
 
 	resp := map[string]any{
 		"total_queries":      total,
@@ -649,6 +652,7 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 		"blocked_percentage": blockedPct,
 		"cached_percentage":  cachedPct,
 		"avg_latency_ms":     avgLat,
+		"qps":                qps,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -875,6 +879,53 @@ func (s *StatsAPI) startDumpLoop() {
 						s.logger.Error("failed to dump stats", zap.Error(err))
 					}
 				}
+			case <-s.closeNotify:
+				return
+			}
+		}
+	}()
+}
+
+func (s *StatsAPI) startQPSLoop() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		const windowSize = 5
+		history := make([]uint64, windowSize)
+		timestamps := make([]int64, windowSize)
+		lastTotal := s.totalQueries.Load()
+
+		for {
+			select {
+			case now := <-ticker.C:
+				curTotal := s.totalQueries.Load()
+				var delta uint64
+				if curTotal >= lastTotal {
+					delta = curTotal - lastTotal
+				}
+				lastTotal = curTotal
+
+				nowSec := now.Unix()
+				idx := int(nowSec % windowSize)
+				history[idx] = delta
+				timestamps[idx] = nowSec
+
+				var sum uint64
+				validSecs := 0
+				for i := 0; i < windowSize; i++ {
+					if timestamps[i] > 0 && nowSec-timestamps[i] < windowSize {
+						sum += history[i]
+						validSecs++
+					}
+				}
+
+				var qps uint64
+				if validSecs > 0 {
+					qps = (sum + uint64(validSecs)/2) / uint64(validSecs)
+				}
+				s.currentQPS.Store(qps)
+
 			case <-s.closeNotify:
 				return
 			}
