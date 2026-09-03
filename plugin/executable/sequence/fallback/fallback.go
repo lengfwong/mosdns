@@ -107,8 +107,13 @@ func (f *fallback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 	return f.doFallback(ctx, qCtx)
 }
 
+type fallbackResult struct {
+	r    *dns.Msg
+	qCtx *query_context.Context
+}
+
 func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) error {
-	respChan := make(chan *dns.Msg, 2) // resp could be nil.
+	respChan := make(chan *fallbackResult, 2) // resp could be nil.
 	primFailed := make(chan struct{})
 	primDone := make(chan struct{})
 
@@ -129,7 +134,7 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			respChan <- nil
 		} else {
 			close(primDone)
-			respChan <- r
+			respChan <- &fallbackResult{r: r, qCtx: qCtx}
 		}
 	}()
 
@@ -167,18 +172,23 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			case <-timer.C: // or timed out.
 			}
 		}
-		respChan <- r
+		if r == nil {
+			respChan <- nil
+		} else {
+			respChan <- &fallbackResult{r: r, qCtx: qCtx}
+		}
 	}()
 
 	for i := 0; i < 2; i++ {
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
-		case r := <-respChan:
-			if r == nil { // One of goroutines finished but failed.
+		case res := <-respChan:
+			if res == nil || res.r == nil { // One of goroutines finished but failed.
 				continue
 			}
-			qCtx.SetResponse(r)
+			qCtx.SetResponse(res.r)
+			qCtx.CopyMetadataFrom(res.qCtx)
 			return nil
 		}
 	}

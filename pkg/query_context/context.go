@@ -253,12 +253,53 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 	}
 	d.upstreamOpt = ctx.upstreamOpt
 
+	if ctx.UpstreamSelected != nil {
+		u := *ctx.UpstreamSelected
+		d.UpstreamSelected = &u
+	}
+	if len(ctx.RuleHits) > 0 {
+		d.RuleHits = make([]RuleHit, len(ctx.RuleHits))
+		copy(d.RuleHits, ctx.RuleHits)
+	}
+	d.CacheState = ctx.CacheState
 	d.FromHosts = ctx.FromHosts
 	d.FromArbitrary = ctx.FromArbitrary
 
 	d.kv = copyMap(ctx.kv)
 	d.marks = copyMap(ctx.marks)
 	return d
+}
+
+// CopyMetadataFrom copies execution metadata and log details from src Context.
+func (ctx *Context) CopyMetadataFrom(src *Context) {
+	if src == nil {
+		return
+	}
+	ctx.upstreamOpt = src.upstreamOpt
+	ctx.UpstreamSelected = src.UpstreamSelected
+	if len(src.RuleHits) > 0 {
+		ctx.RuleHits = src.RuleHits
+	}
+	ctx.CacheState = src.CacheState
+	ctx.FromHosts = src.FromHosts
+	ctx.FromArbitrary = src.FromArbitrary
+
+	if src.marks != nil {
+		if ctx.marks == nil {
+			ctx.marks = make(map[uint32]struct{})
+		}
+		for k, v := range src.marks {
+			ctx.marks[k] = v
+		}
+	}
+	if src.kv != nil {
+		if ctx.kv == nil {
+			ctx.kv = make(map[uint32]any)
+		}
+		for k, v := range src.kv {
+			ctx.kv[k] = v
+		}
+	}
 }
 
 // StoreValue stores any v in to this Context
