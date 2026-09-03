@@ -428,6 +428,12 @@ func TestStatsAPIPersistence(t *testing.T) {
 		if i%3 == 0 {
 			s1.cachedQueries.Add(1)
 		}
+		if i%4 == 0 {
+			s1.hostsQueries.Add(1)
+		}
+		if i%5 == 0 {
+			s1.arbitraryQueries.Add(1)
+		}
 		s1.totalLatencyUs.Add(uint64(i * 5000))
 		s1.topStats.Record(fmt.Sprintf("test%d.com.", i), "192.168.1.100", i%2 == 0)
 		s1.historyStats.Record(time.Now(), i%2 == 0, i%3 == 0)
@@ -478,6 +484,12 @@ func TestStatsAPIPersistence(t *testing.T) {
 	}
 	if s2.cachedQueries.Load() != 3 {
 		t.Errorf("expected 3 cached queries after load, got %d", s2.cachedQueries.Load())
+	}
+	if s2.hostsQueries.Load() != 2 {
+		t.Errorf("expected 2 hosts queries after load, got %d", s2.hostsQueries.Load())
+	}
+	if s2.arbitraryQueries.Load() != 2 {
+		t.Errorf("expected 2 arbitrary queries after load, got %d", s2.arbitraryQueries.Load())
 	}
 
 	totalLogs, logs := s2.ringBuffer.QueryLogs(10, 0, "", "all")
@@ -568,3 +580,136 @@ func TestStatsAPIQPS(t *testing.T) {
 		t.Errorf("expected initial qps 0, got %v", qps)
 	}
 }
+
+func TestStatsAPICachedPercentageExcludesHostsAndArbitrary(t *testing.T) {
+	s := NewStatsAPI(&Args{Capacity: 100}, zap.NewNop())
+	router := s.Router()
+
+	// 100 total queries: 20 blocked, 15 hosts, 15 arbitrary, 25 cached, 25 forwarded to upstream
+	// denominator = 100 - (20 + 15 + 15) = 50
+	// cached_percentage = 25 / 50 = 50%
+	s.totalQueries.Store(100)
+	s.blockedQueries.Store(20)
+	s.hostsQueries.Store(15)
+	s.arbitraryQueries.Store(15)
+	s.cachedQueries.Store(25)
+	s.totalLatencyUs.Store(50000)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+
+	var statsResp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &statsResp); err != nil {
+		t.Fatalf("failed to unmarshal stats response: %v", err)
+	}
+
+	if hostsQueries := statsResp["hosts_queries"].(float64); hostsQueries != 15 {
+		t.Errorf("expected hosts_queries 15, got %v", hostsQueries)
+	}
+	if arbitraryQueries := statsResp["arbitrary_queries"].(float64); arbitraryQueries != 15 {
+		t.Errorf("expected arbitrary_queries 15, got %v", arbitraryQueries)
+	}
+	if blockedPct := statsResp["blocked_percentage"].(float64); blockedPct != 20.0 {
+		t.Errorf("expected blocked_percentage 20.0, got %v", blockedPct)
+	}
+	if cachedPct := statsResp["cached_percentage"].(float64); cachedPct != 50.0 {
+		t.Errorf("expected cached_percentage 50.0, got %v", cachedPct)
+	}
+}
+
+func TestStatsAPIExecWithHostsAndArbitrary(t *testing.T) {
+	s := NewStatsAPI(&Args{Capacity: 100}, zap.NewNop())
+
+	// Test 1: Normal hosts resolution
+	q1 := new(dns.Msg)
+	q1.SetQuestion("lan.local.", dns.TypeA)
+	qCtx1 := query_context.NewContext(q1)
+
+	execHosts := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "lan.local.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   []byte{192, 168, 1, 10},
+		})
+		qCtx.SetResponse(resp)
+		qCtx.SetFromHosts()
+		return nil
+	})
+
+	walker1 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execHosts}}, nil)
+	if err := s.Exec(context.Background(), qCtx1, walker1); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if s.hostsQueries.Load() != 1 {
+		t.Errorf("expected hostsQueries 1, got %d", s.hostsQueries.Load())
+	}
+	_, logs1 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs1) != 1 || logs1[0].Upstream != "hosts" {
+		t.Errorf("expected upstream 'hosts', got %+v", logs1)
+	}
+
+	// Test 2: Hosts returning 0.0.0.0 (adblock) -> should be counted in blockedQueries, NOT hostsQueries
+	q2 := new(dns.Msg)
+	q2.SetQuestion("ad.example.com.", dns.TypeA)
+	qCtx2 := query_context.NewContext(q2)
+
+	execHostsBlock := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "ad.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   []byte{0, 0, 0, 0},
+		})
+		qCtx.SetResponse(resp)
+		qCtx.SetFromHosts()
+		return nil
+	})
+
+	walker2 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execHostsBlock}}, nil)
+	if err := s.Exec(context.Background(), qCtx2, walker2); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if s.blockedQueries.Load() != 1 {
+		t.Errorf("expected blockedQueries 1, got %d", s.blockedQueries.Load())
+	}
+	if s.hostsQueries.Load() != 1 { // Should still be 1 (not incremented)
+		t.Errorf("expected hostsQueries to remain 1, got %d", s.hostsQueries.Load())
+	}
+
+	// Test 3: Arbitrary resolution
+	q3 := new(dns.Msg)
+	q3.SetQuestion("custom.zone.", dns.TypeA)
+	qCtx3 := query_context.NewContext(q3)
+
+	execArbitrary := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "custom.zone.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   []byte{10, 0, 0, 1},
+		})
+		qCtx.SetResponse(resp)
+		qCtx.SetFromArbitrary()
+		return nil
+	})
+
+	walker3 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execArbitrary}}, nil)
+	if err := s.Exec(context.Background(), qCtx3, walker3); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if s.arbitraryQueries.Load() != 1 {
+		t.Errorf("expected arbitraryQueries 1, got %d", s.arbitraryQueries.Load())
+	}
+	_, logs3 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs3) != 1 || logs3[0].Upstream != "arbitrary" {
+		t.Errorf("expected upstream 'arbitrary', got %+v", logs3)
+	}
+}
+
+

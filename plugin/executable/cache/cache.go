@@ -234,6 +234,8 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		c.hitTotal.Inc()
 		cachedResp.Id = q.Id // change msg id
 		qCtx.SetResponse(cachedResp)
+		qCtx.FromHosts = false
+		qCtx.FromArbitrary = false
 		if v, _, ok := c.backend.Get(key(msgKey)); ok && v != nil {
 			v.hitCount.Add(1)
 			ttl := int(v.expirationTime.Sub(v.storedTime).Seconds())

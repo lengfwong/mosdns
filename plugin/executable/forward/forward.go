@@ -201,6 +201,8 @@ func (f *Forward) Exec(ctx context.Context, qCtx *query_context.Context) (err er
 		return err
 	}
 	qCtx.SetResponse(r)
+	qCtx.FromHosts = false
+	qCtx.FromArbitrary = false
 	return nil
 }
 

@@ -75,6 +75,8 @@ type Context struct {
 	UpstreamSelected *UpstreamLog
 	RuleHits         []RuleHit
 	CacheState       CacheLog
+	FromHosts        bool
+	FromArbitrary    bool
 
 	// lazy init.
 	kv    map[uint32]any
@@ -105,6 +107,16 @@ func (ctx *Context) SetCacheState(hit, lazyHit bool, ttl, remainingTTL int) {
 		TTL:          ttl,
 		RemainingTTL: remainingTTL,
 	}
+}
+
+func (ctx *Context) SetFromHosts() {
+	ctx.FromHosts = true
+	ctx.FromArbitrary = false
+}
+
+func (ctx *Context) SetFromArbitrary() {
+	ctx.FromArbitrary = true
+	ctx.FromHosts = false
 }
 
 var contextUid atomic.Uint32
@@ -241,6 +253,9 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 	}
 	d.upstreamOpt = ctx.upstreamOpt
 
+	d.FromHosts = ctx.FromHosts
+	d.FromArbitrary = ctx.FromArbitrary
+
 	d.kv = copyMap(ctx.kv)
 	d.marks = copyMap(ctx.marks)
 	return d
@@ -349,6 +364,13 @@ func (ctx *Context) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 		enc.AddInt("remaining_ttl", ctx.CacheState.RemainingTTL)
 		return nil
 	}))
+
+	if ctx.FromHosts {
+		encoder.AddBool("hosts", true)
+	}
+	if ctx.FromArbitrary {
+		encoder.AddBool("arbitrary", true)
+	}
 
 	if r := ctx.resp; r != nil {
 		encoder.AddInt("rcode", r.Rcode)

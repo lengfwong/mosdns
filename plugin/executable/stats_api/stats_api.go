@@ -487,18 +487,20 @@ func (h *HistoryStats) Import(points map[int64]HistoryBucketData) {
 }
 
 type StatsDumpData struct {
-	Version        int                         `json:"version"`
-	Timestamp      int64                       `json:"timestamp"`
-	TotalQueries   uint64                      `json:"total_queries"`
-	BlockedQueries uint64                      `json:"blocked_queries"`
-	CachedQueries  uint64                      `json:"cached_queries"`
-	TotalLatencyUs uint64                      `json:"total_latency_us"`
-	TopDomains     map[string]uint64           `json:"top_domains,omitempty"`
-	TopClients     map[string]uint64           `json:"top_clients,omitempty"`
-	TopBlocked     map[string]uint64           `json:"top_blocked,omitempty"`
-	History        map[int64]HistoryBucketData `json:"history,omitempty"`
-	Logs           []LogEntry                  `json:"logs,omitempty"`
-	SeqID          uint64                      `json:"seq_id,omitempty"`
+	Version          int                         `json:"version"`
+	Timestamp        int64                       `json:"timestamp"`
+	TotalQueries     uint64                      `json:"total_queries"`
+	BlockedQueries   uint64                      `json:"blocked_queries"`
+	CachedQueries    uint64                      `json:"cached_queries"`
+	HostsQueries     uint64                      `json:"hosts_queries,omitempty"`
+	ArbitraryQueries uint64                      `json:"arbitrary_queries,omitempty"`
+	TotalLatencyUs   uint64                      `json:"total_latency_us"`
+	TopDomains       map[string]uint64           `json:"top_domains,omitempty"`
+	TopClients       map[string]uint64           `json:"top_clients,omitempty"`
+	TopBlocked       map[string]uint64           `json:"top_blocked,omitempty"`
+	History          map[int64]HistoryBucketData `json:"history,omitempty"`
+	Logs             []LogEntry                  `json:"logs,omitempty"`
+	SeqID            uint64                      `json:"seq_id,omitempty"`
 }
 
 type StatsAPI struct {
@@ -509,11 +511,13 @@ type StatsAPI struct {
 	topStats     *TopStats
 	historyStats *HistoryStats
 
-	totalQueries   atomic.Uint64
-	blockedQueries atomic.Uint64
-	cachedQueries  atomic.Uint64
-	totalLatencyUs atomic.Uint64
-	currentQPS     atomic.Uint64
+	totalQueries     atomic.Uint64
+	blockedQueries   atomic.Uint64
+	cachedQueries    atomic.Uint64
+	hostsQueries     atomic.Uint64
+	arbitraryQueries atomic.Uint64
+	totalLatencyUs   atomic.Uint64
+	currentQPS       atomic.Uint64
 
 	updatedCount atomic.Uint64
 	closeNotify  chan struct{}
@@ -626,6 +630,8 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 	total := s.totalQueries.Load()
 	blocked := s.blockedQueries.Load()
 	cached := s.cachedQueries.Load()
+	hosts := s.hostsQueries.Load()
+	arbitrary := s.arbitraryQueries.Load()
 	latUs := s.totalLatencyUs.Load()
 
 	var blockedPct, cachedPct, avgLat float64
@@ -633,8 +639,9 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 		blockedPct = float64(blocked) / float64(total) * 100.0
 		avgLat = (float64(latUs) / float64(total)) / 1000.0
 	}
-	if total > blocked {
-		cachedPct = float64(cached) / float64(total-blocked) * 100.0
+	excluded := blocked + hosts + arbitrary
+	if total > excluded {
+		cachedPct = float64(cached) / float64(total-excluded) * 100.0
 		if cachedPct > 100.0 {
 			cachedPct = 100.0
 		}
@@ -649,6 +656,8 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 		"total_queries":      total,
 		"blocked_queries":    blocked,
 		"cached_queries":     cached,
+		"hosts_queries":      hosts,
+		"arbitrary_queries":  arbitrary,
 		"blocked_percentage": blockedPct,
 		"cached_percentage":  cachedPct,
 		"avg_latency_ms":     avgLat,
@@ -778,12 +787,14 @@ func (s *StatsAPI) writeDump(w io.Writer) error {
 	gw.Name = statsDumpHeader
 
 	data := StatsDumpData{
-		Version:        1,
-		Timestamp:      time.Now().Unix(),
-		TotalQueries:   s.totalQueries.Load(),
-		BlockedQueries: s.blockedQueries.Load(),
-		CachedQueries:  s.cachedQueries.Load(),
-		TotalLatencyUs: s.totalLatencyUs.Load(),
+		Version:          1,
+		Timestamp:        time.Now().Unix(),
+		TotalQueries:     s.totalQueries.Load(),
+		BlockedQueries:   s.blockedQueries.Load(),
+		CachedQueries:    s.cachedQueries.Load(),
+		HostsQueries:     s.hostsQueries.Load(),
+		ArbitraryQueries: s.arbitraryQueries.Load(),
+		TotalLatencyUs:   s.totalLatencyUs.Load(),
 	}
 
 	data.TopDomains, data.TopClients, data.TopBlocked = s.topStats.Export()
@@ -817,6 +828,8 @@ func (s *StatsAPI) readDump(r io.Reader) error {
 	s.totalQueries.Store(data.TotalQueries)
 	s.blockedQueries.Store(data.BlockedQueries)
 	s.cachedQueries.Store(data.CachedQueries)
+	s.hostsQueries.Store(data.HostsQueries)
+	s.arbitraryQueries.Store(data.ArbitraryQueries)
 	s.totalLatencyUs.Store(data.TotalLatencyUs)
 
 	s.topStats.Import(data.TopDomains, data.TopClients, data.TopBlocked)
@@ -1022,10 +1035,24 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 		s.blockedQueries.Add(1)
 	}
 
+	isHosts := qCtx.FromHosts && !isBlocked && !isCached && qCtx.UpstreamSelected == nil
+	if isHosts {
+		s.hostsQueries.Add(1)
+	}
+
+	isArbitrary := qCtx.FromArbitrary && !isBlocked && !isCached && qCtx.UpstreamSelected == nil
+	if isArbitrary {
+		s.arbitraryQueries.Add(1)
+	}
+
 	// Extract Upstream information
 	var upstream string
 	if isCached {
 		upstream = "cache"
+	} else if isHosts {
+		upstream = "hosts"
+	} else if isArbitrary {
+		upstream = "arbitrary"
 	} else if u := qCtx.UpstreamSelected; u != nil {
 		if u.Addr != "" {
 			if !strings.Contains(u.Addr, "://") {
@@ -1083,6 +1110,10 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	if rule == "" {
 		if isCached {
 			rule = "cache"
+		} else if isHosts {
+			rule = "hosts"
+		} else if isArbitrary {
+			rule = "arbitrary"
 		} else {
 			rule = "-"
 		}
