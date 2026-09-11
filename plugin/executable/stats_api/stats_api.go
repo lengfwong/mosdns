@@ -975,6 +975,8 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 		s.cachedQueries.Add(1)
 	}
 
+	hasUpstream := isCached || qCtx.UpstreamSelected != nil
+
 	r := qCtx.R()
 	var status string
 	var answers []AnswerDTO
@@ -982,7 +984,9 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 
 	if r == nil {
 		status = "DROPPED"
-		isBlocked = true
+		if !hasUpstream {
+			isBlocked = true
+		}
 	} else {
 		if rcodeStr, ok := dns.RcodeToString[r.Rcode]; ok {
 			status = rcodeStr
@@ -990,7 +994,7 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 			status = fmt.Sprintf("RCODE%d", r.Rcode)
 		}
 
-		if (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused) && qQuestion.Qtype != dns.TypeHTTPS {
+		if !hasUpstream && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused) && qQuestion.Qtype != dns.TypeHTTPS {
 			isBlocked = true
 		}
 

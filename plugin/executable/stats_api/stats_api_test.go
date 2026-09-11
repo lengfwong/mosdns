@@ -712,4 +712,126 @@ func TestStatsAPIExecWithHostsAndArbitrary(t *testing.T) {
 	}
 }
 
+func TestStatsAPINoAnswerUpstreamAndBlocked(t *testing.T) {
+	s := NewStatsAPI(&Args{Capacity: 100}, zap.NewNop())
 
+	// Case 1: Upstream returns NXDOMAIN (no answers) -> NOT blocked
+	q1 := new(dns.Msg)
+	q1.SetQuestion("apps.itunes-nocookie.com.", dns.TypeA)
+	qCtx1 := query_context.NewContext(q1)
+	qCtx1.SetUpstreamSelected("https://doh.pub/dns-query", "DoH", "remote", "forward_remote")
+
+	execUpstreamNX := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Rcode = dns.RcodeNameError
+		qCtx.SetResponse(resp)
+		return nil
+	})
+
+	walker1 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execUpstreamNX}}, nil)
+	if err := s.Exec(context.Background(), qCtx1, walker1); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if s.blockedQueries.Load() != 0 {
+		t.Errorf("expected blockedQueries 0, got %d", s.blockedQueries.Load())
+	}
+	_, logs1 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs1) != 1 || logs1[0].IsBlocked || logs1[0].Status != "NXDOMAIN" || logs1[0].Upstream != "https://doh.pub/dns-query" {
+		t.Errorf("expected unblocked NXDOMAIN upstream log, got %+v", logs1)
+	}
+
+	// Case 2: Cache returns NXDOMAIN (no answers) -> NOT blocked
+	q2 := new(dns.Msg)
+	q2.SetQuestion("cached-nx.example.com.", dns.TypeA)
+	qCtx2 := query_context.NewContext(q2)
+	qCtx2.SetCacheState(true, false, 300, 300)
+
+	execCacheNX := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Rcode = dns.RcodeNameError
+		qCtx.SetResponse(resp)
+		return nil
+	})
+
+	walker2 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execCacheNX}}, nil)
+	if err := s.Exec(context.Background(), qCtx2, walker2); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if s.blockedQueries.Load() != 0 {
+		t.Errorf("expected blockedQueries 0, got %d", s.blockedQueries.Load())
+	}
+	_, logs2 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs2) != 1 || logs2[0].IsBlocked || logs2[0].Status != "NXDOMAIN" || logs2[0].Upstream != "cache" {
+		t.Errorf("expected unblocked NXDOMAIN cache log, got %+v", logs2)
+	}
+
+	// Case 3: Local reject (no upstream, NXDOMAIN) -> IS blocked
+	q3 := new(dns.Msg)
+	q3.SetQuestion("ad.reject.com.", dns.TypeA)
+	qCtx3 := query_context.NewContext(q3)
+
+	execLocalReject := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Rcode = dns.RcodeNameError
+		qCtx.SetResponse(resp)
+		return nil
+	})
+
+	walker3 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execLocalReject}}, nil)
+	if err := s.Exec(context.Background(), qCtx3, walker3); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if s.blockedQueries.Load() != 1 {
+		t.Errorf("expected blockedQueries 1, got %d", s.blockedQueries.Load())
+	}
+	_, logs3 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs3) != 1 || !logs3[0].IsBlocked {
+		t.Errorf("expected blocked log, got %+v", logs3)
+	}
+
+	// Case 4: Upstream dropped (r == nil with upstream) -> NOT blocked
+	q4 := new(dns.Msg)
+	q4.SetQuestion("timeout.example.com.", dns.TypeA)
+	qCtx4 := query_context.NewContext(q4)
+	qCtx4.SetUpstreamSelected("8.8.8.8:53", "UDP", "remote", "forward_remote")
+
+	execUpstreamDrop := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		return nil
+	})
+
+	walker4 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execUpstreamDrop}}, nil)
+	if err := s.Exec(context.Background(), qCtx4, walker4); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if s.blockedQueries.Load() != 1 { // Still 1 from case 3
+		t.Errorf("expected blockedQueries to remain 1, got %d", s.blockedQueries.Load())
+	}
+	_, logs4 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs4) != 1 || logs4[0].IsBlocked || logs4[0].Status != "DROPPED" {
+		t.Errorf("expected unblocked DROPPED log, got %+v", logs4)
+	}
+
+	// Case 5: Local drop (r == nil without upstream) -> IS blocked
+	q5 := new(dns.Msg)
+	q5.SetQuestion("local.drop.com.", dns.TypeA)
+	qCtx5 := query_context.NewContext(q5)
+
+	execLocalDrop := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		return nil
+	})
+
+	walker5 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execLocalDrop}}, nil)
+	if err := s.Exec(context.Background(), qCtx5, walker5); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+	if s.blockedQueries.Load() != 2 {
+		t.Errorf("expected blockedQueries 2, got %d", s.blockedQueries.Load())
+	}
+	_, logs5 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs5) != 1 || !logs5[0].IsBlocked || logs5[0].Status != "DROPPED" {
+		t.Errorf("expected blocked DROPPED log, got %+v", logs5)
+	}
+}
