@@ -275,6 +275,7 @@ func (ctx *Context) CopyMetadataFrom(src *Context) {
 	if src == nil {
 		return
 	}
+	ctx.respOpt = src.respOpt
 	ctx.upstreamOpt = src.upstreamOpt
 	ctx.UpstreamSelected = src.UpstreamSelected
 	if len(src.RuleHits) > 0 {
