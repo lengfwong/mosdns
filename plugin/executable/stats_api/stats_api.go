@@ -982,10 +982,33 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	var answers []AnswerDTO
 	isBlocked := false
 
+	isTimeout := false
+	if err != nil {
+		errStr := strings.ToLower(err.Error())
+		if errors.Is(err, context.DeadlineExceeded) ||
+			strings.Contains(errStr, "timeout") ||
+			strings.Contains(errStr, "deadline") ||
+			strings.Contains(errStr, "all upstream servers failed") ||
+			strings.Contains(errStr, "all primary and secondary executables failed") {
+			isTimeout = true
+		}
+	}
+	if elapsed >= 4*time.Second && r == nil {
+		isTimeout = true
+	}
+
 	if r == nil {
-		status = "DROPPED"
-		if !hasUpstream {
-			isBlocked = true
+		if isTimeout {
+			status = "TIMEOUT"
+			isBlocked = false
+		} else if err != nil {
+			status = "ERROR"
+			isBlocked = false
+		} else {
+			status = "DROPPED"
+			if !hasUpstream {
+				isBlocked = true
+			}
 		}
 	} else {
 		if rcodeStr, ok := dns.RcodeToString[r.Rcode]; ok {

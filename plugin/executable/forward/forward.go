@@ -267,9 +267,11 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	done := make(chan struct{})
 	defer close(done)
 
+	var lastAttempted *upstreamWrapper
 	r := rand.IntN(len(us))
 	for i := 0; i < concurrent; i++ {
 		u := us[(r+i)%len(us)]
+		lastAttempted = u
 		qc := copyPayload(queryPayload)
 		go func(uqid uint32, question dns.Question, chosenUpstream *upstreamWrapper) {
 			defer pool.ReleaseBuf(qc)
@@ -318,29 +320,42 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 			}
 
 			if chosenUpstream != nil {
-				addr := chosenUpstream.cfg.Addr
-				proto := "UDP"
-				if strings.Contains(addr, "://") {
-					parts := strings.SplitN(addr, "://", 2)
-					proto = strings.ToUpper(parts[0])
-					addr = parts[1]
-				}
-				if proto == "TLS" {
-					proto = "DoT"
-				} else if proto == "HTTPS" {
-					proto = "DoH"
-				} else if proto == "QUIC" || proto == "DOQ" {
-					proto = "DoQ"
-				}
-				qCtx.SetUpstreamSelected(chosenUpstream.cfg.Addr, proto, chosenUpstream.cfg.Tag, f.pluginTag)
+				f.setUpstream(qCtx, chosenUpstream)
 			}
 
 			return r, nil
 		case <-ctx.Done():
+			if qCtx.UpstreamSelected == nil && lastAttempted != nil {
+				f.setUpstream(qCtx, lastAttempted)
+			}
 			return nil, context.Cause(ctx)
 		}
 	}
+	if qCtx.UpstreamSelected == nil && lastAttempted != nil {
+		f.setUpstream(qCtx, lastAttempted)
+	}
 	return nil, errors.New("all upstream servers failed")
+}
+
+func (f *Forward) setUpstream(qCtx *query_context.Context, u *upstreamWrapper) {
+	if u == nil {
+		return
+	}
+	addr := u.cfg.Addr
+	proto := "UDP"
+	if strings.Contains(addr, "://") {
+		parts := strings.SplitN(addr, "://", 2)
+		proto = strings.ToUpper(parts[0])
+		addr = parts[1]
+	}
+	if proto == "TLS" {
+		proto = "DoT"
+	} else if proto == "HTTPS" {
+		proto = "DoH"
+	} else if proto == "QUIC" || proto == "DOQ" {
+		proto = "DoQ"
+	}
+	qCtx.SetUpstreamSelected(u.cfg.Addr, proto, u.cfg.Tag, f.pluginTag)
 }
 
 func quickSetup(bq sequence.BQ, s string) (any, error) {

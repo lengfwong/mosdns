@@ -122,12 +122,13 @@ checkMatchesLoop:
 		switch {
 		case n.E != nil:
 			hasRespBefore := qCtx.R() != nil
-			if err := n.E.Exec(ctx, qCtx); err != nil {
-				return err
-			}
+			err := n.E.Exec(ctx, qCtx)
 			hasRespAfter := qCtx.R() != nil
-			if shouldLogRule(n, hasRespBefore, hasRespAfter) {
+			if shouldLogRule(n, hasRespBefore, hasRespAfter) || err != nil {
 				qCtx.AddRuleHit(w.sequenceTag, n.RuleMatches, n.RuleExec)
+			}
+			if err != nil {
+				return err
 			}
 			p++
 			continue

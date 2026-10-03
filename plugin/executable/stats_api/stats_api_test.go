@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -833,5 +834,26 @@ func TestStatsAPINoAnswerUpstreamAndBlocked(t *testing.T) {
 	_, logs5 := s.ringBuffer.QueryLogs(1, 0, "", "all")
 	if len(logs5) != 1 || !logs5[0].IsBlocked || logs5[0].Status != "DROPPED" {
 		t.Errorf("expected blocked DROPPED log, got %+v", logs5)
+	}
+
+	// Case 6: Upstream timeout -> NOT blocked, status is TIMEOUT
+	q6 := new(dns.Msg)
+	q6.SetQuestion("timedout.example.com.", dns.TypeAAAA)
+	qCtx6 := query_context.NewContext(q6)
+	qCtx6.SetUpstreamSelected("114.114.114.114:53", "UDP", "local", "forward_local")
+
+	execTimeout := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		return errors.New("all upstream servers failed")
+	})
+
+	walker6 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execTimeout}}, nil)
+	_ = s.Exec(context.Background(), qCtx6, walker6)
+
+	if s.blockedQueries.Load() != 2 {
+		t.Errorf("expected blockedQueries to remain 2, got %d", s.blockedQueries.Load())
+	}
+	_, logs6 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs6) != 1 || logs6[0].IsBlocked || logs6[0].Status != "TIMEOUT" {
+		t.Errorf("expected unblocked TIMEOUT log, got %+v", logs6)
 	}
 }
