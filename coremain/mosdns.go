@@ -152,6 +152,19 @@ func (m *Mosdns) GetPlugin(tag string) any {
 	return m.plugins[tag]
 }
 
+type Flusher interface {
+	Flush()
+}
+
+// FlushAllCaches flushes all registered plugins that implement Flusher.
+func (m *Mosdns) FlushAllCaches() {
+	for _, p := range m.plugins {
+		if f, ok := p.(Flusher); ok {
+			f.Flush()
+		}
+	}
+}
+
 // GetMetricsReg returns a prometheus.Registerer with a prefix of "mosdns_"
 func (m *Mosdns) GetMetricsReg() prometheus.Registerer {
 	return prometheus.WrapRegistererWithPrefix("mosdns_", m.metricsReg)

@@ -373,6 +373,11 @@ func (c *Cache) Close() error {
 	return c.backend.Close()
 }
 
+// Flush removes all stored entries from backend.
+func (c *Cache) Flush() {
+	c.backend.Flush()
+}
+
 func (c *Cache) loadDump() error {
 	if len(c.args.DumpFile) == 0 {
 		return nil

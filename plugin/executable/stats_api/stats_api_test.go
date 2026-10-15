@@ -29,6 +29,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -855,5 +856,210 @@ func TestStatsAPINoAnswerUpstreamAndBlocked(t *testing.T) {
 	_, logs6 := s.ringBuffer.QueryLogs(1, 0, "", "all")
 	if len(logs6) != 1 || logs6[0].IsBlocked || logs6[0].Status != "TIMEOUT" {
 		t.Errorf("expected unblocked TIMEOUT log, got %+v", logs6)
+	}
+}
+
+func TestStatsAPIAnswersNotNull(t *testing.T) {
+	s := NewStatsAPI(&Args{Capacity: 10}, zap.NewNop())
+	q := new(dns.Msg)
+	q.SetQuestion("nodata.example.com.", dns.TypeA)
+	qCtx := query_context.NewContext(q)
+
+	execEmpty := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		// Empty Answer slice
+		qCtx.SetResponse(resp)
+		return nil
+	})
+
+	walker := sequence.NewChainWalker([]*sequence.ChainNode{{E: execEmpty}}, nil)
+	if err := s.Exec(context.Background(), qCtx, walker); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+
+	_, logs := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(logs))
+	}
+	if logs[0].Answers == nil {
+		t.Errorf("expected non-nil answers slice, got nil")
+	}
+
+	rawJSON, err := json.Marshal(logs[0])
+	if err != nil {
+		t.Fatalf("failed to marshal log entry: %v", err)
+	}
+	if !strings.Contains(string(rawJSON), `"answers":[]`) {
+		t.Errorf("expected answers:[] in JSON, got: %s", string(rawJSON))
+	}
+}
+
+func TestStatsAPISVCBNotBlocked(t *testing.T) {
+	s := NewStatsAPI(&Args{Capacity: 10}, zap.NewNop())
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeSVCB)
+	qCtx := query_context.NewContext(q)
+
+	execNX := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Rcode = dns.RcodeNameError
+		qCtx.SetResponse(resp)
+		return nil
+	})
+
+	walker := sequence.NewChainWalker([]*sequence.ChainNode{{E: execNX}}, nil)
+	if err := s.Exec(context.Background(), qCtx, walker); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+
+	if s.blockedQueries.Load() != 0 {
+		t.Errorf("expected blockedQueries 0 for SVCB NXDOMAIN, got %d", s.blockedQueries.Load())
+	}
+}
+
+func TestStatsAPILoopbackResolution(t *testing.T) {
+	s := NewStatsAPI(&Args{Capacity: 10}, zap.NewNop())
+
+	// 1. Hosts returning 127.0.0.1 (e.g. localhost) -> NOT blocked, hostsQueries=1
+	q1 := new(dns.Msg)
+	q1.SetQuestion("localhost.", dns.TypeA)
+	qCtx1 := query_context.NewContext(q1)
+
+	execHosts127 := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "localhost.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   []byte{127, 0, 0, 1},
+		})
+		qCtx.SetResponse(resp)
+		qCtx.SetFromHosts()
+		return nil
+	})
+
+	walker1 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execHosts127}}, nil)
+	if err := s.Exec(context.Background(), qCtx1, walker1); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+
+	if s.blockedQueries.Load() != 0 {
+		t.Errorf("expected blockedQueries 0 for hosts 127.0.0.1, got %d", s.blockedQueries.Load())
+	}
+	if s.hostsQueries.Load() != 1 {
+		t.Errorf("expected hostsQueries 1, got %d", s.hostsQueries.Load())
+	}
+	_, logs1 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs1) != 1 || logs1[0].IsBlocked || logs1[0].Upstream != "hosts" {
+		t.Errorf("expected unblocked hosts log for 127.0.0.1, got %+v", logs1)
+	}
+
+	// 2. Hosts returning 127.0.0.1 for an ad/blocked domain (e.g. baidu.com) -> IS blocked
+	q2 := new(dns.Msg)
+	q2.SetQuestion("baidu.com.", dns.TypeA)
+	qCtx2 := query_context.NewContext(q2)
+
+	execHostsBaidu127 := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "baidu.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   []byte{127, 0, 0, 1},
+		})
+		qCtx.SetResponse(resp)
+		qCtx.SetFromHosts()
+		return nil
+	})
+
+	walker2 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execHostsBaidu127}}, nil)
+	if err := s.Exec(context.Background(), qCtx2, walker2); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+
+	if s.blockedQueries.Load() != 1 {
+		t.Errorf("expected blockedQueries 1 for hosts 127.0.0.1 baidu.com, got %d", s.blockedQueries.Load())
+	}
+	if s.hostsQueries.Load() != 1 {
+		t.Errorf("expected hostsQueries to remain 1, got %d", s.hostsQueries.Load())
+	}
+	_, logs2 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs2) != 1 || !logs2[0].IsBlocked {
+		t.Errorf("expected blocked log for hosts 127.0.0.1 baidu.com, got %+v", logs2)
+	}
+
+	// 3. Local black_hole returning 127.0.0.1 (no upstream, no hosts) -> IS blocked
+	q3 := new(dns.Msg)
+	q3.SetQuestion("ad.blackhole.com.", dns.TypeA)
+	qCtx3 := query_context.NewContext(q3)
+
+	execBlackhole127 := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "ad.blackhole.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   []byte{127, 0, 0, 1},
+		})
+		qCtx.SetResponse(resp)
+		return nil
+	})
+
+	walker3 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execBlackhole127}}, nil)
+	if err := s.Exec(context.Background(), qCtx3, walker3); err != nil {
+		t.Fatalf("Exec failed: %v", err)
+	}
+
+	if s.blockedQueries.Load() != 2 {
+		t.Errorf("expected blockedQueries 2 for black_hole 127.0.0.1, got %d", s.blockedQueries.Load())
+	}
+	_, logs3 := s.ringBuffer.QueryLogs(1, 0, "", "all")
+	if len(logs3) != 1 || !logs3[0].IsBlocked || logs3[0].Rule != "block" {
+		t.Errorf("expected blocked log with rule 'block', got %+v", logs3)
+	}
+}
+
+func TestStatsAPIQueryLogsExtendedFilters(t *testing.T) {
+	rb := NewRingBuffer(10)
+	rb.Push(LogEntry{Domain: "t.com.", Status: "TIMEOUT", Upstream: "upstream1"})
+	rb.Push(LogEntry{Domain: "e.com.", Status: "ERROR", Upstream: "upstream1"})
+	rb.Push(LogEntry{Domain: "nx.com.", Status: "NXDOMAIN", Upstream: "upstream1"})
+	rb.Push(LogEntry{Domain: "h.com.", Status: "NOERROR", Upstream: "hosts", Rule: "hosts"})
+
+	totalTimeout, logsTimeout := rb.QueryLogs(10, 0, "", "timeout")
+	if totalTimeout != 1 || logsTimeout[0].Domain != "t.com." {
+		t.Errorf("filter timeout failed: total=%d, logs=%+v", totalTimeout, logsTimeout)
+	}
+
+	totalError, logsError := rb.QueryLogs(10, 0, "", "error")
+	if totalError != 1 || logsError[0].Domain != "e.com." {
+		t.Errorf("filter error failed: total=%d, logs=%+v", totalError, logsError)
+	}
+
+	totalNX, logsNX := rb.QueryLogs(10, 0, "", "nxdomain")
+	if totalNX != 1 || logsNX[0].Domain != "nx.com." {
+		t.Errorf("filter nxdomain failed: total=%d, logs=%+v", totalNX, logsNX)
+	}
+
+	totalHosts, logsHosts := rb.QueryLogs(10, 0, "", "hosts")
+	if totalHosts != 1 || logsHosts[0].Domain != "h.com." {
+		t.Errorf("filter hosts failed: total=%d, logs=%+v", totalHosts, logsHosts)
+	}
+}
+
+func TestHistoryStats168Hours(t *testing.T) {
+	h := NewHistoryStats()
+	now := time.Now()
+
+	// Record point 100 hours ago
+	h.Record(now.Add(-100*time.Hour), false, true)
+
+	points := h.GetHistory(168)
+	if len(points) != 168 {
+		t.Fatalf("expected 168 points, got %d", len(points))
+	}
+
+	point100 := points[len(points)-1-100]
+	if point100.Total != 1 || point100.Cached != 1 {
+		t.Errorf("expected 1 total query 100 hours ago, got %+v", point100)
 	}
 }

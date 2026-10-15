@@ -180,6 +180,11 @@ func (s *Selector) Close() error {
 	return nil
 }
 
+// Flush removes all cached entries from preferTypOkCache.
+func (s *Selector) Flush() {
+	s.preferTypOkCache.Flush()
+}
+
 func NewPreferIpv4(bq sequence.BQ) *Selector {
 	return newSelector(bq, dns.TypeA)
 }

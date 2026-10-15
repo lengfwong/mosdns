@@ -28,6 +28,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -137,25 +138,48 @@ func (r *RingBuffer) Clear() {
 }
 
 func (r *RingBuffer) QueryLogs(limit, offset int, search, filter string) (int, []LogEntry) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	all := make([]LogEntry, 0, r.count)
-	for i := 0; i < r.count; i++ {
-		idx := (r.head - 1 - i + r.capacity) % r.capacity
-		all = append(all, r.buf[idx])
-	}
-
 	searchLower := strings.ToLower(strings.TrimSpace(search))
 	filterLower := strings.ToLower(strings.TrimSpace(filter))
 
-	filtered := make([]LogEntry, 0, len(all))
-	for _, entry := range all {
-		if filterLower == "blocked" && !entry.IsBlocked {
-			continue
-		}
-		if filterLower == "cached" && !entry.IsCached {
-			continue
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	filtered := make([]LogEntry, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		idx := (r.head - 1 - i + r.capacity) % r.capacity
+		entry := r.buf[idx]
+
+		switch filterLower {
+		case "blocked":
+			if !entry.IsBlocked {
+				continue
+			}
+		case "cached":
+			if !entry.IsCached {
+				continue
+			}
+		case "hosts":
+			if entry.Upstream != "hosts" && entry.Rule != "hosts" {
+				continue
+			}
+		case "arbitrary":
+			if entry.Upstream != "arbitrary" && entry.Rule != "arbitrary" {
+				continue
+			}
+		case "timeout":
+			if entry.Status != "TIMEOUT" {
+				continue
+			}
+		case "error":
+			if entry.Status != "ERROR" {
+				continue
+			}
+		case "all", "":
+			// no filter
+		default:
+			if !strings.EqualFold(entry.Status, filterLower) {
+				continue
+			}
 		}
 
 		if searchLower != "" {
@@ -241,19 +265,49 @@ func NewTopStats() *TopStats {
 	}
 }
 
+const maxTopEntries = 20000
+
+func pruneMap(m map[string]uint64) {
+	if len(m) <= maxTopEntries {
+		return
+	}
+	for k, v := range m {
+		if v <= 1 {
+			delete(m, k)
+		}
+	}
+	if len(m) > maxTopEntries {
+		for k, v := range m {
+			if v <= 2 {
+				delete(m, k)
+			}
+		}
+	}
+}
+
 func (t *TopStats) Record(domain, clientIP string, isBlocked bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if domain != "" {
+		domainLower := strings.ToLower(domain)
 		if isBlocked {
-			t.topBlocked[domain]++
+			t.topBlocked[domainLower]++
+			if len(t.topBlocked) > maxTopEntries {
+				pruneMap(t.topBlocked)
+			}
 		} else {
-			t.topDomains[domain]++
+			t.topDomains[domainLower]++
+			if len(t.topDomains) > maxTopEntries {
+				pruneMap(t.topDomains)
+			}
 		}
 	}
 	if clientIP != "" {
 		t.topClients[clientIP]++
+		if len(t.topClients) > maxTopEntries {
+			pruneMap(t.topClients)
+		}
 	}
 }
 
@@ -303,38 +357,6 @@ func (t *TopStats) Import(domains, clients, blocked map[string]uint64) {
 	}
 }
 
-func getSortedTop(m map[string]uint64, isClient bool, limit int) []TopItem {
-	type pair struct {
-		key   string
-		count uint64
-	}
-	pairs := make([]pair, 0, len(m))
-	for k, v := range m {
-		pairs = append(pairs, pair{key: k, count: v})
-	}
-	sort.Slice(pairs, func(i, j int) bool {
-		if pairs[i].count == pairs[j].count {
-			return pairs[i].key < pairs[j].key
-		}
-		return pairs[i].count > pairs[j].count
-	})
-
-	if limit > len(pairs) {
-		limit = len(pairs)
-	}
-	res := make([]TopItem, 0, limit)
-	for i := 0; i < limit; i++ {
-		item := TopItem{Count: pairs[i].count}
-		if isClient {
-			item.ClientIP = pairs[i].key
-		} else {
-			item.Domain = pairs[i].key
-		}
-		res = append(res, item)
-	}
-	return res
-}
-
 func (t *TopStats) GetTop(limit int) ([]TopItem, []TopItem, []TopItem) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -343,16 +365,56 @@ func (t *TopStats) GetTop(limit int) ([]TopItem, []TopItem, []TopItem) {
 		limit = 10
 	}
 
-	cleanTopDomains := make(map[string]uint64, len(t.topDomains))
+	type pair struct {
+		key   string
+		count uint64
+	}
+
+	sortPairs := func(pairs []pair, isClient bool) []TopItem {
+		sort.Slice(pairs, func(i, j int) bool {
+			if pairs[i].count == pairs[j].count {
+				return pairs[i].key < pairs[j].key
+			}
+			return pairs[i].count > pairs[j].count
+		})
+
+		n := limit
+		if n > len(pairs) {
+			n = len(pairs)
+		}
+		res := make([]TopItem, 0, n)
+		for i := 0; i < n; i++ {
+			item := TopItem{Count: pairs[i].count}
+			if isClient {
+				item.ClientIP = pairs[i].key
+			} else {
+				item.Domain = pairs[i].key
+			}
+			res = append(res, item)
+		}
+		return res
+	}
+
+	domainPairs := make([]pair, 0, len(t.topDomains))
 	for domain, count := range t.topDomains {
 		if _, isBlocked := t.topBlocked[domain]; !isBlocked {
-			cleanTopDomains[domain] = count
+			domainPairs = append(domainPairs, pair{key: domain, count: count})
 		}
 	}
 
-	topDomains := getSortedTop(cleanTopDomains, false, limit)
-	topClients := getSortedTop(t.topClients, true, limit)
-	topBlocked := getSortedTop(t.topBlocked, false, limit)
+	clientPairs := make([]pair, 0, len(t.topClients))
+	for client, count := range t.topClients {
+		clientPairs = append(clientPairs, pair{key: client, count: count})
+	}
+
+	blockedPairs := make([]pair, 0, len(t.topBlocked))
+	for blocked, count := range t.topBlocked {
+		blockedPairs = append(blockedPairs, pair{key: blocked, count: count})
+	}
+
+	topDomains := sortPairs(domainPairs, false)
+	topClients := sortPairs(clientPairs, true)
+	topBlocked := sortPairs(blockedPairs, false)
 	return topDomains, topClients, topBlocked
 }
 
@@ -400,8 +462,8 @@ func (h *HistoryStats) Record(t time.Time, isBlocked, isCached bool) {
 			bucket = &HistoryBucket{}
 			h.points[tHour] = bucket
 
-			// Clean up old buckets beyond 48 hours
-			cutoff := t.Add(-48 * time.Hour).Unix()
+			// Clean up old buckets beyond 168 hours (7 days)
+			cutoff := t.Add(-168 * time.Hour).Unix()
 			for k := range h.points {
 				if k < cutoff {
 					delete(h.points, k)
@@ -474,7 +536,7 @@ func (h *HistoryStats) Import(points map[int64]HistoryBucketData) {
 	defer h.mu.Unlock()
 
 	h.points = make(map[int64]*HistoryBucket, len(points))
-	cutoff := time.Now().Add(-48 * time.Hour).Unix()
+	cutoff := time.Now().Add(-168 * time.Hour).Unix()
 	for k, v := range points {
 		if k >= cutoff {
 			bucket := &HistoryBucket{}
@@ -506,6 +568,8 @@ type StatsDumpData struct {
 type StatsAPI struct {
 	args   *Args
 	logger *zap.Logger
+	m      *coremain.Mosdns
+	tag    string
 
 	ringBuffer   *RingBuffer
 	topStats     *TopStats
@@ -528,6 +592,8 @@ type StatsAPI struct {
 func Init(bp *coremain.BP, args any) (any, error) {
 	a := args.(*Args)
 	s := NewStatsAPI(a, bp.L())
+	s.m = bp.M()
+	s.tag = bp.Tag()
 	bp.RegAPI(s.Router())
 	return s, nil
 }
@@ -554,12 +620,14 @@ func QuickSetup(bq sequence.BQ, s string) (any, error) {
 			dumpInterval = d
 		}
 	}
-	return NewStatsAPI(&Args{
+	api := NewStatsAPI(&Args{
 		Listen:       listen,
 		Capacity:     capacity,
 		DumpFile:     dumpFile,
 		DumpInterval: dumpInterval,
-	}, bq.L()), nil
+	}, bq.L())
+	api.m = bq.M()
+	return api, nil
 }
 
 func NewStatsAPI(args *Args, logger *zap.Logger) *StatsAPI {
@@ -584,8 +652,9 @@ func NewStatsAPI(args *Args, logger *zap.Logger) *StatsAPI {
 
 	if len(args.Listen) > 0 {
 		srv := &http.Server{
-			Addr:    args.Listen,
-			Handler: s.Router(),
+			Addr:              args.Listen,
+			Handler:           s.Router(),
+			ReadHeaderTimeout: 5 * time.Second,
 		}
 		s.httpServer = srv
 		go func() {
@@ -623,6 +692,16 @@ func (s *StatsAPI) Router() *chi.Mux {
 	r.Post("/api/v1/logs/clear", s.handleClearLogs)
 	r.Post("/api/v1/cache/clear", s.handleClearCache)
 
+	// Relative endpoints when mounted under a prefix (e.g. /plugins/<tag>/stats)
+	r.Get("/stats", s.handleStats)
+	r.Get("/logs", s.handleLogs)
+	r.Get("/top", s.handleTop)
+	r.Get("/history", s.handleHistory)
+	r.Get("/dump", s.handleDump)
+	r.Post("/load_dump", s.handleLoadDump)
+	r.Post("/logs/clear", s.handleClearLogs)
+	r.Post("/cache/clear", s.handleClearCache)
+
 	return r
 }
 
@@ -637,6 +716,9 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 	var blockedPct, cachedPct, avgLat float64
 	if total > 0 {
 		blockedPct = float64(blocked) / float64(total) * 100.0
+		if blockedPct > 100.0 {
+			blockedPct = 100.0
+		}
 		avgLat = (float64(latUs) / float64(total)) / 1000.0
 	}
 	excluded := blocked + hosts + arbitrary
@@ -751,7 +833,7 @@ func (s *StatsAPI) handleDump(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *StatsAPI) handleLoadDump(w http.ResponseWriter, req *http.Request) {
-	if err := s.readDump(req.Body); err != nil {
+	if err := s.readDump(io.LimitReader(req.Body, 100<<20)); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -763,6 +845,7 @@ func (s *StatsAPI) handleClearLogs(w http.ResponseWriter, req *http.Request) {
 	s.ringBuffer.Clear()
 	s.topStats.Clear()
 	s.updatedCount.Add(1)
+	_ = s.dumpStats()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -772,6 +855,9 @@ func (s *StatsAPI) handleClearLogs(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *StatsAPI) handleClearCache(w http.ResponseWriter, req *http.Request) {
+	if s.m != nil {
+		s.m.FlushAllCaches()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"success": true,
@@ -864,15 +950,35 @@ func (s *StatsAPI) dumpStats() error {
 	if len(s.args.DumpFile) == 0 {
 		return nil
 	}
-	f, err := os.Create(s.args.DumpFile)
+	if dir := filepath.Dir(s.args.DumpFile); dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	tmpFile := fmt.Sprintf("%s.tmp.%d", s.args.DumpFile, time.Now().UnixNano())
+	f, err := os.Create(tmpFile)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	if err := s.writeDump(f); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile)
 		return fmt.Errorf("failed to write stats dump, %w", err)
 	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to sync stats dump, %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to close stats dump, %w", err)
+	}
+
+	if err := os.Rename(tmpFile, s.args.DumpFile); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to commit stats dump: %w", err)
+	}
+
 	s.logger.Info("stats dumped successfully", zap.String("file", s.args.DumpFile))
 	return nil
 }
@@ -890,6 +996,7 @@ func (s *StatsAPI) startDumpLoop() {
 				if s.updatedCount.Swap(0) > 0 {
 					if err := s.dumpStats(); err != nil {
 						s.logger.Error("failed to dump stats", zap.Error(err))
+						s.updatedCount.Add(1)
 					}
 				}
 			case <-s.closeNotify:
@@ -946,6 +1053,15 @@ func (s *StatsAPI) startQPSLoop() {
 	}()
 }
 
+func isLoopbackDomain(domain string) bool {
+	d := strings.ToLower(strings.TrimSuffix(domain, "."))
+	return d == "localhost" ||
+		strings.HasSuffix(d, ".localhost") ||
+		d == "localhost.localdomain" ||
+		d == "ip6-localhost" ||
+		d == "ip6-loopback"
+}
+
 func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
 	start := time.Now()
 	err := next.ExecNext(ctx, qCtx)
@@ -979,7 +1095,7 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 
 	r := qCtx.R()
 	var status string
-	var answers []AnswerDTO
+	answers := make([]AnswerDTO, 0)
 	isBlocked := false
 
 	isTimeout := false
@@ -1017,7 +1133,8 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 			status = fmt.Sprintf("RCODE%d", r.Rcode)
 		}
 
-		if !hasUpstream && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused) && qQuestion.Qtype != dns.TypeHTTPS {
+		if !hasUpstream && (r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeRefused) &&
+			qQuestion.Qtype != dns.TypeHTTPS && qQuestion.Qtype != dns.TypeSVCB {
 			isBlocked = true
 		}
 
@@ -1031,12 +1148,12 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 			switch record := rr.(type) {
 			case *dns.A:
 				dataStr = record.A.String()
-				if dataStr == "0.0.0.0" || dataStr == "127.0.0.1" {
+				if dataStr == "0.0.0.0" || (dataStr == "127.0.0.1" && !isLoopbackDomain(domain)) {
 					isBlocked = true
 				}
 			case *dns.AAAA:
 				dataStr = record.AAAA.String()
-				if dataStr == "::" || dataStr == "::1" {
+				if dataStr == "::" || (dataStr == "::1" && !isLoopbackDomain(domain)) {
 					isBlocked = true
 				}
 			case *dns.CNAME:
@@ -1047,6 +1164,10 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 				dataStr = record.Ptr
 			case *dns.MX:
 				dataStr = record.Mx
+			case *dns.NS:
+				dataStr = record.Ns
+			case *dns.SRV:
+				dataStr = fmt.Sprintf("%d %d %d %s", record.Priority, record.Weight, record.Port, record.Target)
 			default:
 				dataStr = rr.String()
 			}
@@ -1123,12 +1244,12 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 			break
 		}
 
-		if exec != "" && exec != "$stats_collector" {
+		if exec != "" && exec != "$stats_collector" && exec != "stats_api" && (s.tag == "" || exec != s.tag) {
 			rule = exec
 			break
 		}
 
-		if hit.Sequence != "" && hit.Sequence != "has_resp_sequence" && hit.Sequence != "main_sequence" {
+		if hit.Sequence != "" && hit.Sequence != "has_resp_sequence" && hit.Sequence != "main_sequence" && (s.tag == "" || hit.Sequence != s.tag) {
 			rule = hit.Sequence
 			break
 		}
@@ -1141,6 +1262,8 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 			rule = "hosts"
 		} else if isArbitrary {
 			rule = "arbitrary"
+		} else if isBlocked {
+			rule = "block"
 		} else {
 			rule = "-"
 		}
@@ -1173,13 +1296,13 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 func (s *StatsAPI) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.closeNotify)
-		if err := s.dumpStats(); err != nil {
-			s.logger.Error("failed to dump stats on close", zap.Error(err))
-		}
 		if s.httpServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			_ = s.httpServer.Shutdown(ctx)
+		}
+		if err := s.dumpStats(); err != nil {
+			s.logger.Error("failed to dump stats on close", zap.Error(err))
 		}
 	})
 	return nil
