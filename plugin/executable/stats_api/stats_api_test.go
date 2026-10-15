@@ -1063,3 +1063,75 @@ func TestHistoryStats168Hours(t *testing.T) {
 		t.Errorf("expected 1 total query 100 hours ago, got %+v", point100)
 	}
 }
+
+func TestStatsAPITimeoutExclusionFromLatency(t *testing.T) {
+	s := NewStatsAPI(&Args{Capacity: 10}, zap.NewNop())
+
+	// 1. Successful fast query (e.g. 5ms)
+	q1 := new(dns.Msg)
+	q1.SetQuestion("fast.com.", dns.TypeA)
+	qCtx1 := query_context.NewContext(q1)
+
+	execFast := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		time.Sleep(5 * time.Millisecond)
+		resp := new(dns.Msg)
+		resp.SetReply(qCtx.Q())
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "fast.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   []byte{1, 1, 1, 1},
+		})
+		qCtx.SetResponse(resp)
+		return nil
+	})
+
+	walker1 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execFast}}, nil)
+	if err := s.Exec(context.Background(), qCtx1, walker1); err != nil {
+		t.Fatalf("fast query failed: %v", err)
+	}
+
+	// 2. Timeout query (simulated timeout with deadline exceeded error)
+	q2 := new(dns.Msg)
+	q2.SetQuestion("timeout.com.", dns.TypeA)
+	qCtx2 := query_context.NewContext(q2)
+
+	execTimeout := sequence.ExecutableFunc(func(ctx context.Context, qCtx *query_context.Context) error {
+		time.Sleep(50 * time.Millisecond)
+		return context.DeadlineExceeded
+	})
+
+	walker2 := sequence.NewChainWalker([]*sequence.ChainNode{{E: execTimeout}}, nil)
+	_ = s.Exec(context.Background(), qCtx2, walker2)
+
+	if s.totalQueries.Load() != 2 {
+		t.Errorf("expected 2 total queries, got %d", s.totalQueries.Load())
+	}
+	if s.timeoutQueries.Load() != 1 {
+		t.Errorf("expected 1 timeout query, got %d", s.timeoutQueries.Load())
+	}
+	if s.latencyQueries.Load() != 1 {
+		t.Errorf("expected 1 latency query (excluding timeout), got %d", s.latencyQueries.Load())
+	}
+
+	// Test HTTP /api/v1/stats output
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	w := httptest.NewRecorder()
+	s.Router().ServeHTTP(w, req)
+
+	var stats map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &stats); err != nil {
+		t.Fatalf("failed to parse stats response: %v", err)
+	}
+
+	if stats["timeout_queries"].(float64) != 1 {
+		t.Errorf("expected timeout_queries == 1, got %v", stats["timeout_queries"])
+	}
+	if stats["timeout_percentage"].(float64) != 50.0 {
+		t.Errorf("expected timeout_percentage == 50.0, got %v", stats["timeout_percentage"])
+	}
+
+	// avg_latency_ms should be around 5ms, definitely not pulled up to >20ms by the 50ms timeout!
+	avgLat := stats["avg_latency_ms"].(float64)
+	if avgLat >= 20.0 {
+		t.Errorf("avg_latency_ms %v ms was polluted by timeout query!", avgLat)
+	}
+}

@@ -556,7 +556,9 @@ type StatsDumpData struct {
 	CachedQueries    uint64                      `json:"cached_queries"`
 	HostsQueries     uint64                      `json:"hosts_queries,omitempty"`
 	ArbitraryQueries uint64                      `json:"arbitrary_queries,omitempty"`
+	TimeoutQueries   uint64                      `json:"timeout_queries,omitempty"`
 	TotalLatencyUs   uint64                      `json:"total_latency_us"`
+	LatencyQueries   uint64                      `json:"latency_queries,omitempty"`
 	TopDomains       map[string]uint64           `json:"top_domains,omitempty"`
 	TopClients       map[string]uint64           `json:"top_clients,omitempty"`
 	TopBlocked       map[string]uint64           `json:"top_blocked,omitempty"`
@@ -580,7 +582,9 @@ type StatsAPI struct {
 	cachedQueries    atomic.Uint64
 	hostsQueries     atomic.Uint64
 	arbitraryQueries atomic.Uint64
+	timeoutQueries   atomic.Uint64
 	totalLatencyUs   atomic.Uint64
+	latencyQueries   atomic.Uint64
 	currentQPS       atomic.Uint64
 
 	updatedCount atomic.Uint64
@@ -711,15 +715,23 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 	cached := s.cachedQueries.Load()
 	hosts := s.hostsQueries.Load()
 	arbitrary := s.arbitraryQueries.Load()
+	timeout := s.timeoutQueries.Load()
 	latUs := s.totalLatencyUs.Load()
+	latQueries := s.latencyQueries.Load()
 
-	var blockedPct, cachedPct, avgLat float64
+	var blockedPct, cachedPct, timeoutPct, avgLat float64
 	if total > 0 {
 		blockedPct = float64(blocked) / float64(total) * 100.0
 		if blockedPct > 100.0 {
 			blockedPct = 100.0
 		}
-		avgLat = (float64(latUs) / float64(total)) / 1000.0
+		timeoutPct = float64(timeout) / float64(total) * 100.0
+		if timeoutPct > 100.0 {
+			timeoutPct = 100.0
+		}
+	}
+	if latQueries > 0 {
+		avgLat = (float64(latUs) / float64(latQueries)) / 1000.0
 	}
 	excluded := blocked + hosts + arbitrary
 	if total > excluded {
@@ -731,6 +743,7 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 
 	blockedPct = math.Round(blockedPct*100) / 100
 	cachedPct = math.Round(cachedPct*100) / 100
+	timeoutPct = math.Round(timeoutPct*100) / 100
 	avgLat = math.Round(avgLat*100) / 100
 	qps := s.currentQPS.Load()
 
@@ -740,8 +753,10 @@ func (s *StatsAPI) handleStats(w http.ResponseWriter, req *http.Request) {
 		"cached_queries":     cached,
 		"hosts_queries":      hosts,
 		"arbitrary_queries":  arbitrary,
+		"timeout_queries":    timeout,
 		"blocked_percentage": blockedPct,
 		"cached_percentage":  cachedPct,
+		"timeout_percentage": timeoutPct,
 		"avg_latency_ms":     avgLat,
 		"qps":                qps,
 	}
@@ -880,7 +895,9 @@ func (s *StatsAPI) writeDump(w io.Writer) error {
 		CachedQueries:    s.cachedQueries.Load(),
 		HostsQueries:     s.hostsQueries.Load(),
 		ArbitraryQueries: s.arbitraryQueries.Load(),
+		TimeoutQueries:   s.timeoutQueries.Load(),
 		TotalLatencyUs:   s.totalLatencyUs.Load(),
+		LatencyQueries:   s.latencyQueries.Load(),
 	}
 
 	data.TopDomains, data.TopClients, data.TopBlocked = s.topStats.Export()
@@ -916,7 +933,13 @@ func (s *StatsAPI) readDump(r io.Reader) error {
 	s.cachedQueries.Store(data.CachedQueries)
 	s.hostsQueries.Store(data.HostsQueries)
 	s.arbitraryQueries.Store(data.ArbitraryQueries)
+	s.timeoutQueries.Store(data.TimeoutQueries)
 	s.totalLatencyUs.Store(data.TotalLatencyUs)
+	latQueries := data.LatencyQueries
+	if latQueries == 0 && data.TotalQueries > data.TimeoutQueries {
+		latQueries = data.TotalQueries - data.TimeoutQueries
+	}
+	s.latencyQueries.Store(latQueries)
 
 	s.topStats.Import(data.TopDomains, data.TopClients, data.TopBlocked)
 	s.historyStats.Import(data.History)
@@ -1068,7 +1091,6 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	elapsed := time.Since(start)
 
 	s.totalQueries.Add(1)
-	s.totalLatencyUs.Add(uint64(elapsed.Microseconds()))
 	s.updatedCount.Add(1)
 
 	var clientIP string
@@ -1181,6 +1203,13 @@ func (s *StatsAPI) Exec(ctx context.Context, qCtx *query_context.Context, next s
 
 	if isBlocked {
 		s.blockedQueries.Add(1)
+	}
+
+	if isTimeout {
+		s.timeoutQueries.Add(1)
+	} else {
+		s.totalLatencyUs.Add(uint64(elapsed.Microseconds()))
+		s.latencyQueries.Add(1)
 	}
 
 	isHosts := qCtx.FromHosts && !isBlocked && !isCached && qCtx.UpstreamSelected == nil
