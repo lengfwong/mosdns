@@ -67,6 +67,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 func StartServer(bp *coremain.BP, args *Args) (*QuicServer, error) {
+	args.init()
 	logger := bp.L()
 
 	dh, err := server_utils.NewHandler(bp, args.Entry)

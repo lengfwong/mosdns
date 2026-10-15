@@ -37,12 +37,16 @@ func ParseRules(r io.Reader, blacklist, whitelist *domain.MixMatcher[struct{}]) 
 			continue
 		}
 
-		// Handle hosts file format: "0.0.0.0 domain" or "127.0.0.1 domain"
+		// Handle hosts file format: "0.0.0.0 domain1 domain2" or "127.0.0.1 domain"
 		if fields := strings.Fields(line); len(fields) >= 2 {
 			if ip := net.ParseIP(fields[0]); ip != nil {
-				host := fields[1]
-				if host != "" && host != "localhost" {
-					_ = blacklist.Add("full:"+host, struct{}{})
+				for _, host := range fields[1:] {
+					if strings.HasPrefix(host, "#") {
+						break
+					}
+					if host != "" && host != "localhost" {
+						_ = blacklist.Add("full:"+host, struct{}{})
+					}
 				}
 				continue
 			}
@@ -87,6 +91,8 @@ func ParseRules(r io.Reader, blacklist, whitelist *domain.MixMatcher[struct{}]) 
 }
 
 func parseAndAddRule(rule string, m *domain.MixMatcher[struct{}]) error {
+	rule = strings.TrimSuffix(rule, "^")
+
 	// 0. Native MosDNS rules: type:pattern
 	if strings.Contains(rule, ":") {
 		typ, _, _ := strings.Cut(rule, ":")

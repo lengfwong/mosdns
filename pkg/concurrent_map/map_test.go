@@ -139,6 +139,42 @@ func TestConcurrentMap_TestAndSet(t *testing.T) {
 	}
 }
 
+func Test_Map_Flush_Concurrency(t *testing.T) {
+	m := NewMap[testMapHashable, int]()
+	var wg sync.WaitGroup
+	const goroutines = 20
+	const iterations = 500
+
+	wg.Add(goroutines * 2 + 1)
+	// readers
+	for i := 0; i < goroutines; i++ {
+		go func(base int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				_, _ = m.Get(testMapHashable(base + (j % 50)))
+			}
+		}(i * 100)
+	}
+	// writers
+	for i := 0; i < goroutines; i++ {
+		go func(base int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				m.Set(testMapHashable(base+(j%50)), j)
+			}
+		}(i * 100)
+	}
+	// flushers
+	go func() {
+		defer wg.Done()
+		for j := 0; j < iterations/5; j++ {
+			m.Flush()
+		}
+	}()
+
+	wg.Wait()
+}
+
 func BenchmarkConcurrentMap_Get_And_Set(b *testing.B) {
 	keys := make([]testMapHashable, 2048)
 	m := NewMap[testMapHashable, int]()

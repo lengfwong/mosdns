@@ -133,8 +133,8 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 			close(primFailed)
 			respChan <- nil
 		} else {
-			close(primDone)
 			respChan <- &fallbackResult{r: r, qCtx: qCtx}
+			close(primDone)
 		}
 	}()
 
@@ -167,7 +167,9 @@ func (f *fallback) doFallback(ctx context.Context, qCtx *query_context.Context) 
 		if f.alwaysStandby && r != nil {
 			select {
 			case <-ctx.Done():
+				return
 			case <-primDone:
+				return
 			case <-primFailed: // only send secondary result when primary is failed.
 			case <-timer.C: // or timed out.
 			}

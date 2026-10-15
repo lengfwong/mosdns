@@ -45,6 +45,8 @@ domain:ntp.org
 full:metrics.icloud.com
 0.0.0.0 singlehotmilf.online
 127.0.0.1 deezer.deliveryengine.adswizz.com
+0.0.0.0 multihost1.com multihost2.com # comment here
+trailingsymbol.com^
 `
 	blacklist := domain.NewMixMatcher[struct{}]()
 	whitelist := domain.NewMixMatcher[struct{}]()
@@ -85,6 +87,11 @@ full:metrics.icloud.com
 		{"sub.singlehotmilf.online", false},        // hosts: exact match only
 		{"deezer.deliveryengine.adswizz.com", true}, // hosts: 127.0.0.1
 		{"sub.deezer.deliveryengine.adswizz.com", false}, // hosts: exact match only
+		{"multihost1.com", true},
+		{"multihost2.com", true},
+		{"comment", false},
+		{"trailingsymbol.com", true},
+		{"sub.trailingsymbol.com", true},
 	}
 
 	for _, tt := range tests {

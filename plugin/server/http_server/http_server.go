@@ -17,7 +17,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package tcp_server
+package http_server
 
 import (
 	"context"
@@ -72,6 +72,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 func StartServer(bp *coremain.BP, args *Args) (*HttpServer, error) {
+	args.init()
 	mux := http.NewServeMux()
 	for _, entry := range args.Entries {
 		dh, err := server_utils.NewHandler(bp, entry.Exec)

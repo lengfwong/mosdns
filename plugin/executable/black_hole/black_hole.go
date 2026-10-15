@@ -25,10 +25,9 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
+	"math/rand"
 	"net/netip"
 	"strings"
-	"math/rand"
-	"sync"
 )
 
 const PluginType = "black_hole"
@@ -42,7 +41,6 @@ var _ sequence.Executable = (*BlackHole)(nil)
 type BlackHole struct {
 	ipv4 []netip.Addr
 	ipv6 []netip.Addr
-	shuffleMutex sync.Mutex
 }
 
 // QuickSetup format: [ipv4|ipv6] ...
@@ -68,21 +66,9 @@ func NewBlackHole(ips []string) (*BlackHole, error) {
 	return b, nil
 }
 
-func (b *BlackHole) shuffleIPs() {
-	b.shuffleMutex.Lock()
-	defer b.shuffleMutex.Unlock()
-	rand.Shuffle(len(b.ipv4), func(i, j int) {
-		b.ipv4[i], b.ipv4[j] = b.ipv4[j], b.ipv4[i]
-	})
-	rand.Shuffle(len(b.ipv6), func(i, j int) {
-		b.ipv6[i], b.ipv6[j] = b.ipv6[j], b.ipv6[i]
-	})
-}
-
 // Exec implements sequence.Executable. It set a response with given ips if
 // query has corresponding qtypes.
 func (b *BlackHole) Exec(_ context.Context, qCtx *query_context.Context) error {
-	b.shuffleIPs()
 	if r := b.Response(qCtx.Q()); r != nil {
 		qCtx.SetResponse(r)
 	}
@@ -103,7 +89,14 @@ func (b *BlackHole) Response(q *dns.Msg) *dns.Msg {
 	case qtype == dns.TypeA && len(b.ipv4) > 0:
 		r := new(dns.Msg)
 		r.SetReply(q)
-		for _, addr := range b.ipv4 {
+		ips := b.ipv4
+		if len(ips) > 1 {
+			ips = append([]netip.Addr(nil), b.ipv4...)
+			rand.Shuffle(len(ips), func(i, j int) {
+				ips[i], ips[j] = ips[j], ips[i]
+			})
+		}
+		for _, addr := range ips {
 			rr := &dns.A{
 				Hdr: dns.RR_Header{
 					Name:   qName,
@@ -120,7 +113,14 @@ func (b *BlackHole) Response(q *dns.Msg) *dns.Msg {
 	case qtype == dns.TypeAAAA && len(b.ipv6) > 0:
 		r := new(dns.Msg)
 		r.SetReply(q)
-		for _, addr := range b.ipv6 {
+		ips := b.ipv6
+		if len(ips) > 1 {
+			ips = append([]netip.Addr(nil), b.ipv6...)
+			rand.Shuffle(len(ips), func(i, j int) {
+				ips[i], ips[j] = ips[j], ips[i]
+			})
+		}
+		for _, addr := range ips {
 			rr := &dns.AAAA{
 				Hdr: dns.RR_Header{
 					Name:   qName,

@@ -61,6 +61,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 func StartServer(bp *coremain.BP, args *Args) (*UdpServer, error) {
+	args.init()
 	dh, err := server_utils.NewHandler(bp, args.Entry)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init dns handler, %w", err)
